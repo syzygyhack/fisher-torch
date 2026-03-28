@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# Testing / Linting
+.pytest_cache/
+.ruff_cache/
+
+# Model weights
+*.pt
+*.bin
+
+# Tool state
+.cardinal/
+.avril/
+.claude/
