@@ -20,12 +20,12 @@ _CLIP_EPSILON = 1e-30
 
 
 @dataclass
-class ProjectionSpec:
-    """Describes a top-k simplex projection.
+class TopkResult:
+    """Metadata for a top-k simplex projection.
 
-    Lightweight mirror of the canonical observatory ProjectionSpec.
-    Records the parameters used so downstream code can interpret
-    the resulting simplex array.
+    Records the parameters used by :func:`topk_softmax` so downstream
+    code can interpret the resulting simplex array.  This is an internal
+    helper — the canonical ``ProjectionSpec`` lives in ``capture.py``.
     """
 
     k: int
@@ -53,6 +53,10 @@ def safe_softmax(
     Tensor
         Probability distribution summing to 1 along *dim*.
     """
+    if temperature <= 0:
+        raise ValueError(
+            f"temperature must be positive, got {temperature}."
+        )
     scaled = logits / temperature
     # Subtract max for numerical stability (redundant with F.softmax but
     # ensures consistent behaviour across backends).
@@ -72,7 +76,7 @@ def topk_softmax(
     temperature: float = 1.0,
     remainder_mode: str = "single_remainder",
     tail_cardinality: int | None = None,
-) -> tuple[Tensor, ProjectionSpec]:
+) -> tuple[Tensor, TopkResult]:
     """Apply softmax, select top-k, and project to simplex.
 
     Combines :func:`safe_softmax` with top-k selection and delegates
@@ -102,6 +106,11 @@ def topk_softmax(
     probs = safe_softmax(logits, temperature=temperature, dim=-1)
     vocab_size = logits.shape[-1]
 
+    if k > vocab_size:
+        raise ValueError(
+            f"top_k ({k}) exceeds vocabulary size ({vocab_size})."
+        )
+
     # Select top-k values.
     top_vals, _ = torch.topk(probs, k, dim=-1)
 
@@ -116,10 +125,10 @@ def topk_softmax(
         device=logits.device, dtype=logits.dtype
     )
 
-    spec = ProjectionSpec(
+    result_meta = TopkResult(
         k=k,
         remainder_mode=remainder_mode,
         tail_cardinality=tail_cardinality,
         original_vocab_size=vocab_size,
     )
-    return simplex, spec
+    return simplex, result_meta

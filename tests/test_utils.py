@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from fisher_torch.utils import ProjectionSpec, safe_softmax, topk_softmax
+from fisher_torch.utils import TopkResult, safe_softmax, topk_softmax
 
 
 class TestSafeSoftmax:
@@ -62,6 +62,16 @@ class TestSafeSoftmax:
         probs = safe_softmax(logits)
         # The non-top entry should be exactly 0, not a tiny float.
         assert (probs[1:] == 0.0).all()
+
+    def test_zero_temperature_raises(self):
+        logits = torch.randn(10)
+        with pytest.raises(ValueError, match="temperature must be positive"):
+            safe_softmax(logits, temperature=0.0)
+
+    def test_negative_temperature_raises(self):
+        logits = torch.randn(10)
+        with pytest.raises(ValueError, match="temperature must be positive"):
+            safe_softmax(logits, temperature=-1.0)
 
 
 class TestTopkSoftmax:
@@ -152,7 +162,7 @@ class TestTopkSoftmax:
     def test_returns_projection_spec(self):
         logits = torch.randn(20)
         _, spec = topk_softmax(logits, 5, remainder_mode="single_remainder")
-        assert isinstance(spec, ProjectionSpec)
+        assert isinstance(spec, TopkResult)
         assert spec.k == 5
         assert spec.remainder_mode == "single_remainder"
         assert spec.original_vocab_size == 20
@@ -162,3 +172,8 @@ class TestTopkSoftmax:
         logits = torch.randn(50)
         simplex, _ = topk_softmax(logits, 10)
         assert (simplex >= 0).all()
+
+    def test_k_exceeds_vocab_raises(self):
+        logits = torch.randn(5)
+        with pytest.raises(ValueError, match="exceeds vocabulary size"):
+            topk_softmax(logits, 10)

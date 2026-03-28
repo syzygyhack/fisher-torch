@@ -9,7 +9,7 @@ from fisher_torch.extractors import (
     extract_routing,
 )
 from fisher_torch.sampling import SamplingPolicy
-from fisher_torch.utils import safe_softmax, topk_softmax
+from fisher_torch.utils import TopkResult, safe_softmax, topk_softmax
 
 __version__ = "0.1.0"
 
@@ -20,6 +20,7 @@ __all__ = [
     # utils
     "safe_softmax",
     "topk_softmax",
+    "TopkResult",
     # sampling
     "SamplingPolicy",
     # extractors

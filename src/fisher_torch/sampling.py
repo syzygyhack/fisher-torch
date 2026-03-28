@@ -96,6 +96,9 @@ class SamplingPolicy:
         ValueError
             If any index is out of bounds.
         """
+        if seq_len <= 0:
+            return []
+
         if self.final_token_only:
             return [seq_len - 1]
 

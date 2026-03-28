@@ -123,3 +123,12 @@ class TestSelectedPositions:
             final_token_only=True, positions=[0, 1, 2]
         )
         assert policy.selected_positions(10) == [9]
+
+    def test_empty_sequence_returns_empty(self):
+        """seq_len=0 should return empty list, not [-1]."""
+        policy = SamplingPolicy(final_token_only=True)
+        assert policy.selected_positions(0) == []
+
+    def test_empty_sequence_all_positions(self):
+        policy = SamplingPolicy(final_token_only=False)
+        assert policy.selected_positions(0) == []
