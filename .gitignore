@@ -19,6 +19,10 @@ venv/
 *.pt
 *.bin
 
+# IDE
+.vscode/
+.idea/
+
 # Tool state
 .cardinal/
 .avril/
