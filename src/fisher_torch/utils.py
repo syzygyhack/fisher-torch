@@ -1,19 +1,37 @@
 """Softmax and top-k simplex helpers.
 
 Provides numerically stable softmax with temperature scaling and
-top-k probability selection with multiple remainder-handling modes.
+top-k probability selection with multiple remainder-handling modes
+via fisher-simplex.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import numpy as np
 import torch
 import torch.nn.functional as F
+from fisher_simplex import topk_to_simplex as _fs_topk_to_simplex
 from torch import Tensor
 
 # Matches fisher-simplex convention for negligible probability mass.
-_CLIP_THRESHOLD = 1e-30
+_CLIP_EPSILON = 1e-30
 
-_VALID_MODES = {"single_remainder", "renormalize", "known_tail"}
+
+@dataclass
+class ProjectionSpec:
+    """Describes a top-k simplex projection.
+
+    Lightweight mirror of the canonical observatory ProjectionSpec.
+    Records the parameters used so downstream code can interpret
+    the resulting simplex array.
+    """
+
+    k: int
+    remainder_mode: str
+    tail_cardinality: int | None = None
+    original_vocab_size: int | None = None
 
 
 def safe_softmax(
@@ -36,68 +54,72 @@ def safe_softmax(
         Probability distribution summing to 1 along *dim*.
     """
     scaled = logits / temperature
+    # Subtract max for numerical stability (redundant with F.softmax but
+    # ensures consistent behaviour across backends).
+    scaled = scaled - scaled.max(dim=dim, keepdim=True).values
     probs = F.softmax(scaled, dim=dim)
     # Clip denormalized floats to exact zero.
-    probs = torch.where(probs < _CLIP_THRESHOLD, torch.zeros_like(probs), probs)
+    probs = torch.where(probs < _CLIP_EPSILON, torch.zeros_like(probs), probs)
     # Renormalize after clipping to maintain valid distribution.
     probs = probs / probs.sum(dim=dim, keepdim=True)
     return probs
 
 
-def topk_to_simplex(
-    probs: Tensor,
+def topk_softmax(
+    logits: Tensor,
+    k: int,
     *,
-    top_k: int,
-    mode: str = "single_remainder",
+    temperature: float = 1.0,
+    remainder_mode: str = "single_remainder",
     tail_cardinality: int | None = None,
-) -> Tensor:
-    """Select top-k probabilities and construct a simplex vector.
+) -> tuple[Tensor, ProjectionSpec]:
+    """Apply softmax, select top-k, and project to simplex.
+
+    Combines :func:`safe_softmax` with top-k selection and delegates
+    remainder handling to :func:`fisher_simplex.topk_to_simplex`.
 
     Parameters
     ----------
-    probs : Tensor
-        Probability tensor of shape ``(..., V)`` where *V* is vocab size.
-    top_k : int
+    logits : Tensor
+        Raw logit values of shape ``(..., V)`` where *V* is vocab size.
+    k : int
         Number of top entries to retain.
-    mode : {"single_remainder", "renormalize", "known_tail"}
-        How to handle the tail mass (see spec Section 1.2).
+    temperature : float, optional
+        Temperature for softmax. Default ``1.0``.
+    remainder_mode : {"single_remainder", "renormalize", "known_tail"}
+        How to handle the tail mass.
     tail_cardinality : int or None
-        Required when *mode* is ``"known_tail"``. Number of bins over
-        which to spread the remainder mass uniformly.
+        Required when *remainder_mode* is ``"known_tail"``.
 
     Returns
     -------
-    Tensor
-        Simplex vector of shape ``(..., K+1)``, ``(..., K)``, or
-        ``(..., K + tail_cardinality)`` depending on *mode*.
-
-    Raises
-    ------
-    ValueError
-        If *mode* is invalid, or ``"known_tail"`` is used without
-        *tail_cardinality*.
+    simplex : Tensor
+        Simplex tensor. Shape depends on *remainder_mode*:
+        ``(..., K+1)``, ``(..., K)``, or ``(..., K + tail_cardinality)``.
+    spec : ProjectionSpec
+        Metadata describing the projection applied.
     """
-    if mode not in _VALID_MODES:
-        raise ValueError(
-            f"Invalid mode {mode!r}. Expected one of {sorted(_VALID_MODES)}."
-        )
-    if mode == "known_tail" and tail_cardinality is None:
-        raise ValueError("tail_cardinality is required when mode='known_tail'.")
+    probs = safe_softmax(logits, temperature=temperature, dim=-1)
+    vocab_size = logits.shape[-1]
 
-    top_vals, _ = torch.topk(probs, top_k, dim=-1)
-    top_sum = top_vals.sum(dim=-1, keepdim=True)
+    # Select top-k values.
+    top_vals, _ = torch.topk(probs, k, dim=-1)
 
-    if mode == "single_remainder":
-        remainder = 1.0 - top_sum
-        remainder = torch.clamp(remainder, min=0.0)
-        return torch.cat([top_vals, remainder], dim=-1)
+    # Delegate to fisher-simplex for remainder handling.
+    top_np = top_vals.detach().cpu().numpy().astype(np.float64)
+    simplex_np = _fs_topk_to_simplex(
+        top_np, mode=remainder_mode, tail_cardinality=tail_cardinality
+    )
 
-    if mode == "renormalize":
-        return top_vals / top_sum
+    # Convert back to tensor matching input device/dtype.
+    simplex = torch.from_numpy(simplex_np.copy()).to(
+        device=logits.device, dtype=logits.dtype
+    )
 
-    # mode == "known_tail"
-    remainder = 1.0 - top_sum
-    remainder = torch.clamp(remainder, min=0.0)
-    per_bin = remainder / tail_cardinality
-    tail = per_bin.expand(*top_vals.shape[:-1], tail_cardinality)
-    return torch.cat([top_vals, tail], dim=-1)
+    spec = ProjectionSpec(
+        k=k,
+        remainder_mode=remainder_mode,
+        tail_cardinality=tail_cardinality,
+        original_vocab_size=vocab_size,
+    )
+    return simplex, spec

@@ -23,6 +23,12 @@ packages = ["src/fisher_torch"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.uv.sources]
+fisher-simplex = { path = "../fisher-simplex", editable = true }
+
 [tool.ruff]
 target-version = "py39"
+src = ["src"]
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "W"]
