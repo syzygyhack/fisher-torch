@@ -6,8 +6,12 @@ import numpy as np
 import pytest
 import torch
 
-from fisher_torch.convert import from_simplex_array, stack_attention, to_simplex_array
-from fisher_torch.utils import truncate_and_renormalize
+from fisher_torch.convert import (
+    from_simplex_array,
+    stack_attention,
+    to_simplex_array,
+    truncate_and_renormalize,
+)
 
 
 class TestToSimplexArray:
@@ -18,10 +22,10 @@ class TestToSimplexArray:
         arr = to_simplex_array(t)
         assert arr.dtype == np.float64
 
-    def test_warns_on_sum_drift(self):
+    def test_silently_renormalizes_sum_drift(self):
+        """to_simplex_array silently renormalizes mild sum drift."""
         t = torch.tensor([0.5, 0.5, 0.5])  # sums to 1.5
-        with pytest.warns(UserWarning, match="drift"):
-            arr = to_simplex_array(t)
+        arr = to_simplex_array(t)
         # After renormalization, should sum to 1.
         np.testing.assert_allclose(arr.sum(), 1.0, atol=1e-12)
 

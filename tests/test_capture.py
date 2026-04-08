@@ -8,7 +8,13 @@ import numpy as np
 import pytest
 import torch
 
-from fisher_torch.capture import CaptureResult, ProjectionSpec, capture_forward
+from fisher_torch.capture import (
+    BatchCaptureResult,
+    CaptureResult,
+    ProjectionSpec,
+    capture_batch,
+    capture_forward,
+)
 from fisher_torch.sampling import SamplingPolicy
 
 # ---------------------------------------------------------------------------
@@ -64,8 +70,12 @@ def _mock_model(
     model.config.vocab_size = VOCAB_SIZE
     model.config.num_hidden_layers = N_LAYERS
     model.config.num_attention_heads = N_HEADS
+    model.config.num_key_value_heads = N_HEADS
     model.config.output_attentions = False
     model.config.output_hidden_states = False
+
+    # Gradient checkpointing off by default.
+    model.is_gradient_checkpointing = False
 
     # lm_head
     torch.manual_seed(42)
@@ -337,6 +347,25 @@ class TestCaptureForward:
         assert "attention_mask" in received
         assert torch.equal(received["attention_mask"], mask)
 
+    def test_tensor_kwargs_auto_moved_to_device(self):
+        """Tensor kwargs like attention_mask should be auto-moved."""
+        model = _mock_model()
+        received = {}
+
+        def tracking_forward(input_ids, **kwargs):
+            received.update(kwargs)
+            return _mock_model_output()
+
+        model.side_effect = tracking_forward
+        model.__call__ = tracking_forward
+
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        mask = torch.ones(1, SEQ_LEN, dtype=torch.long)
+        capture_forward(model, input_ids, attention_mask=mask)
+        # On CPU both are already on the same device; just verify
+        # the kwarg arrives as a tensor.
+        assert isinstance(received["attention_mask"], torch.Tensor)
+
     def test_auto_moves_input_to_model_device(self):
         """input_ids should be auto-moved to the model's input device."""
         model = _mock_model()
@@ -373,3 +402,222 @@ class TestCaptureForward:
         )
         assert result.hidden_states is not None
         model.get_output_embeddings.assert_called_once()
+
+    def test_gqa_groups_mha(self):
+        """MHA model: gqa_groups should be [0, 1, 2, 3] (one group per head)."""
+        model = _mock_model()
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids)
+        assert result.gqa_groups == [0, 1, 2, 3]
+
+    def test_gqa_groups_gqa(self):
+        """GQA model with 4 Q-heads and 2 KV-heads: groups [0, 0, 1, 1]."""
+        model = _mock_model()
+        model.config.num_key_value_heads = 2
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids)
+        assert result.gqa_groups == [0, 0, 1, 1]
+
+    def test_gqa_groups_with_head_selection(self):
+        """gqa_groups must align with selected heads, not all model heads."""
+        model = _mock_model()
+        model.config.num_key_value_heads = 2  # groups: [0, 0, 1, 1]
+        policy = SamplingPolicy(heads=[0, 3])  # head 0 -> group 0, head 3 -> group 1
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids, policy=policy)
+        assert result.gqa_groups == [0, 1]
+
+    def test_gqa_groups_none_when_no_heads(self):
+        """gqa_groups should be None when head info is unavailable."""
+        model = _mock_model()
+        model.config.num_attention_heads = None
+        del model.config.num_key_value_heads
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids)
+        assert result.gqa_groups is None
+
+    def test_gradient_checkpointing_raises(self):
+        """Requesting attention with gradient checkpointing should raise."""
+        model = _mock_model()
+        model.is_gradient_checkpointing = True
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        with pytest.raises(RuntimeError, match="gradient checkpointing"):
+            capture_forward(model, input_ids, attention=True)
+
+    def test_gradient_checkpointing_ok_without_attention(self):
+        """Gradient checkpointing is fine when attention is not requested."""
+        model = _mock_model()
+        model.is_gradient_checkpointing = True
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids, attention=False)
+        assert result.predictions is not None
+
+    def test_no_grad_false_returns_tensors(self):
+        """no_grad=False should populate tensor fields, not numpy."""
+        model = _mock_model()
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids, no_grad=False)
+        assert result.prediction_tensors is not None
+        assert isinstance(result.prediction_tensors, torch.Tensor)
+        assert result.predictions is None
+
+    def test_no_grad_false_attention(self):
+        model = _mock_model(output_attentions=True)
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model, input_ids, predictions=False, attention=True,
+            no_grad=False,
+        )
+        assert result.attention_tensors is not None
+        assert result.attention is None
+
+    def test_detach_to_numpy(self):
+        """detach_to_numpy converts tensor fields to numpy."""
+        model = _mock_model()
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids, no_grad=False)
+        assert result.prediction_tensors is not None
+        result.detach_to_numpy()
+        assert result.predictions is not None
+        assert isinstance(result.predictions, np.ndarray)
+        assert result.prediction_tensors is None
+
+    def test_raw_hidden_states(self):
+        """raw_hidden_states=True should extract raw vectors."""
+        model = _mock_model(output_hidden_states=True)
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model, input_ids, predictions=False,
+            raw_hidden_states=True,
+        )
+        assert result.raw_hidden_states is not None
+        assert isinstance(result.raw_hidden_states, list)
+        assert result.raw_hidden_states[0]["hidden_states"].shape == (1, HIDDEN_DIM)
+
+    def test_raw_hidden_states_independent_of_logit_lens(self):
+        """Both hidden_states and raw_hidden_states can be enabled."""
+        model = _mock_model(output_hidden_states=True)
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model, input_ids, predictions=False,
+            hidden_states=True, raw_hidden_states=True,
+        )
+        assert result.hidden_states is not None
+        assert result.raw_hidden_states is not None
+        # logit lens produces vocab-size predictions
+        assert result.hidden_states[0]["predictions"].shape[-1] == VOCAB_SIZE
+        # raw gives hidden_dim vectors
+        assert result.raw_hidden_states[0]["hidden_states"].shape[-1] == HIDDEN_DIM
+
+    def test_raw_hidden_states_with_no_grad_false(self):
+        model = _mock_model(output_hidden_states=True)
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model, input_ids, predictions=False,
+            raw_hidden_states=True, no_grad=False,
+        )
+        assert result.raw_hidden_state_tensors is not None
+        assert isinstance(
+            result.raw_hidden_state_tensors[0]["hidden_states"],
+            torch.Tensor,
+        )
+
+
+# ---------------------------------------------------------------------------
+# capture_batch
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureBatch:
+    """Tests for capture_batch."""
+
+    def test_returns_batch_result(self):
+        model = _mock_model()
+        prompts = [
+            torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN)),
+            torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN + 2)),
+        ]
+        result = capture_batch(model, prompts)
+        assert isinstance(result, BatchCaptureResult)
+        assert len(result.results) == 2
+        assert result.metadata["n_prompts"] == 2
+
+    def test_single_prompt(self):
+        model = _mock_model()
+        prompts = [torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))]
+        result = capture_batch(model, prompts)
+        assert len(result.results) == 1
+
+    def test_empty_prompts(self):
+        model = _mock_model()
+        result = capture_batch(model, [])
+        assert len(result.results) == 0
+        assert result.metadata["n_prompts"] == 0
+
+    def test_1d_prompts_auto_unsqueeze(self):
+        """1D prompt tensors should be auto-unsqueezed."""
+        model = _mock_model()
+        prompts = [torch.randint(0, VOCAB_SIZE, (SEQ_LEN,))]
+        result = capture_batch(model, prompts)
+        assert len(result.results) == 1
+        assert result.results[0].predictions is not None
+
+    def test_aligned_attention_shape(self):
+        """Aligned attention should have 5D shape with n_positions axis."""
+        model = _mock_model(output_attentions=True)
+        p1 = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        p2 = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_batch(
+            model, [p1, p2], predictions=False, attention=True,
+        )
+        assert result.aligned_attention is not None
+        # (n_prompts, n_layers, n_heads, n_positions, max_seq_len)
+        assert result.aligned_attention.ndim == 5
+        assert result.aligned_attention.shape[0] == 2
+        assert result.aligned_attention.shape[1] == N_LAYERS
+        assert result.aligned_attention.shape[2] == N_HEADS
+
+    def test_seq_lens_in_metadata(self):
+        model = _mock_model()
+        p1 = torch.randint(0, VOCAB_SIZE, (1, 5))
+        p2 = torch.randint(0, VOCAB_SIZE, (1, 8))
+        result = capture_batch(model, [p1, p2])
+        assert result.metadata["seq_lens"] == [5, 8]
+        assert result.metadata["max_seq_len"] == 8
+
+    def test_batch_gt1_prompt_raises(self):
+        """Passing a (batch>1, seq) tensor should raise ValueError."""
+        model = _mock_model()
+        prompt = torch.randint(0, VOCAB_SIZE, (3, SEQ_LEN))
+        with pytest.raises(ValueError, match="single sequence"):
+            capture_batch(model, [prompt])
+
+    def test_aligned_attention_different_seq_lens(self):
+        """Alignment should pad both seq_len and n_positions axes."""
+        model = _mock_model(output_attentions=True)
+        p1 = torch.randint(0, VOCAB_SIZE, (1, 5))
+        p2 = torch.randint(0, VOCAB_SIZE, (1, 12))
+        policy = SamplingPolicy(
+            position_preset="atlas",
+        )
+        result = capture_batch(
+            model, [p1, p2], predictions=False, attention=True,
+            policy=policy,
+        )
+        assert result.aligned_attention is not None
+        assert result.aligned_attention.ndim == 5
+        assert result.aligned_attention.shape[0] == 2
+
+    def test_no_grad_false_skips_alignment(self):
+        """Gradient mode should not populate aligned_attention."""
+        model = _mock_model(output_attentions=True)
+        p1 = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        p2 = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_batch(
+            model, [p1, p2], predictions=False, attention=True,
+            no_grad=False,
+        )
+        assert result.aligned_attention is None
+        # But per-result tensor fields should still be populated.
+        for r in result.results:
+            assert r.attention_tensors is not None

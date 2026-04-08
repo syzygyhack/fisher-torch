@@ -75,6 +75,31 @@ class TestSafeSoftmax:
         with pytest.raises(ValueError, match="temperature must be positive"):
             safe_softmax(logits, temperature=-1.0)
 
+    def test_differentiable_preserves_grad(self):
+        """differentiable=True should allow gradient flow."""
+        logits = torch.randn(10, requires_grad=True)
+        probs = safe_softmax(logits, differentiable=True)
+        # Weighted sum — unlike plain sum (always 1), this varies
+        # with the distribution so gradients are non-zero.
+        weights = torch.arange(10, dtype=torch.float32)
+        loss = (probs * weights).sum()
+        loss.backward()
+        assert logits.grad is not None
+        assert not torch.all(logits.grad == 0)
+
+    def test_differentiable_skips_clip(self):
+        """differentiable=True should NOT clip near-zero entries."""
+        logits = torch.zeros(1000)
+        logits[0] = 100.0
+        probs = safe_softmax(logits, differentiable=True)
+        # Without clipping, tiny entries remain non-zero.
+        assert not (probs[1:] == 0.0).all()
+
+    def test_differentiable_sums_to_one(self):
+        logits = torch.randn(10)
+        probs = safe_softmax(logits, differentiable=True)
+        assert probs.sum().item() == pytest.approx(1.0, abs=1e-6)
+
 
 class TestTopkSoftmax:
     """Tests for topk_softmax."""

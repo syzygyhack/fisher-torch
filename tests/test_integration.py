@@ -81,8 +81,11 @@ class TestFullCaptureMock:
         model.config.vocab_size = VOCAB_SIZE
         model.config.num_hidden_layers = N_LAYERS
         model.config.num_attention_heads = N_HEADS
+        model.config.num_key_value_heads = N_HEADS
         model.config.output_attentions = False
         model.config.output_hidden_states = False
+
+        model.is_gradient_checkpointing = False
 
         torch.manual_seed(42)
         model.lm_head = torch.nn.Linear(HIDDEN_DIM, VOCAB_SIZE, bias=False)

@@ -1,7 +1,9 @@
 """Tensor-simplex conversion utilities.
 
 Converts between PyTorch tensors and validated numpy simplex arrays
-suitable for fisher-simplex operations.
+suitable for fisher-simplex operations.  Also provides post-extraction
+simplex transforms (truncation, renormalization) for cross-sequence
+comparison.
 """
 
 from __future__ import annotations
@@ -29,7 +31,9 @@ def to_simplex_array(tensor: Tensor, *, dim: int = -1) -> NDArray[np.floating]:
         Validated simplex array in float64.
     """
     arr = tensor.detach().cpu().numpy().astype(np.float64)
-    return validate_simplex(arr, axis=dim, renormalize="warn")
+    # Silent renormalize: float32 -> float64 drift is expected and
+    # harmless.  validate_simplex still raises on truly invalid data.
+    return validate_simplex(arr, axis=dim, renormalize="always")
 
 
 def stack_attention(
@@ -104,3 +108,54 @@ def from_simplex_array(
     if dtype is None:
         dtype = torch.float32
     return t.to(device=device, dtype=dtype)
+
+
+def truncate_and_renormalize(
+    simplices: np.ndarray,
+    target_len: int,
+    *,
+    null_threshold: float = 1e-12,
+) -> np.ndarray:
+    """Truncate simplex vectors and renormalize for cross-sequence comparison.
+
+    When comparing attention distributions across sequences of different
+    lengths, truncate to a common length and renormalize so each row
+    is a valid simplex over the shared support.
+
+    Parameters
+    ----------
+    simplices : np.ndarray
+        Simplex array of shape ``(..., seq_len)``.  The typical shape
+        from multi-prompt extraction is
+        ``(n_prompts, n_layers, n_heads, max_seq)``.
+    target_len : int
+        Desired length along the last axis.  Must be ``<= seq_len``.
+    null_threshold : float, optional
+        Rows whose truncated sum falls below this threshold are replaced
+        with the uniform distribution.  Default ``1e-12``.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 array of shape ``(..., target_len)`` with rows summing to 1.
+    """
+    simplices = np.asarray(simplices, dtype=np.float64)
+    current_len = simplices.shape[-1]
+    if target_len > current_len:
+        raise ValueError(
+            f"target_len ({target_len}) exceeds array length ({current_len})."
+        )
+    if target_len == current_len:
+        return simplices.copy()
+
+    trunc = simplices[..., :target_len].copy()
+    row_sums = trunc.sum(axis=-1, keepdims=True)
+
+    # Replace null rows with uniform distribution.
+    null_mask = row_sums.squeeze(-1) < null_threshold
+    if null_mask.any():
+        trunc[null_mask] = 1.0 / target_len
+        row_sums[null_mask[..., np.newaxis]] = 1.0
+
+    trunc /= row_sums
+    return trunc

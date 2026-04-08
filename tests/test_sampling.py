@@ -144,3 +144,77 @@ class TestSelectedPositions:
     def test_empty_sequence_all_positions(self):
         policy = SamplingPolicy(final_token_only=False)
         assert policy.selected_positions(0) == []
+
+
+class TestPositionPresets:
+    """Tests for position_preset feature."""
+
+    def test_invalid_preset_raises(self):
+        with pytest.raises(ValueError, match="Unknown position_preset"):
+            SamplingPolicy(position_preset="bogus")
+
+    def test_atlas_positions_long_sequence(self):
+        """Atlas preset on seq_len=100: early=4, mid=50, late=97, final=99."""
+        policy = SamplingPolicy(position_preset="atlas")
+        result = policy.selected_positions(100)
+        assert result == [4, 50, 97, 99]
+
+    def test_atlas_labels_long_sequence(self):
+        policy = SamplingPolicy(position_preset="atlas")
+        labels = policy.position_labels(100)
+        assert labels == {"early": 4, "mid": 50, "late": 97, "final": 99}
+
+    def test_atlas_overrides_final_token_only(self):
+        """Preset should override the default final_token_only=True."""
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.final_token_only is True  # default unchanged
+        result = policy.selected_positions(100)
+        assert len(result) == 4  # preset wins, not final-token-only
+
+    def test_atlas_short_sequence_deduplicates(self):
+        """Short sequence may collapse positions; duplicates are removed."""
+        policy = SamplingPolicy(position_preset="atlas")
+        result = policy.selected_positions(2)
+        # All positions should be valid and unique
+        assert len(result) == len(set(result))
+        assert all(0 <= p < 2 for p in result)
+
+    def test_atlas_single_token(self):
+        policy = SamplingPolicy(position_preset="atlas")
+        result = policy.selected_positions(1)
+        assert result == [0]
+
+    def test_quartiles_positions(self):
+        policy = SamplingPolicy(position_preset="quartiles")
+        result = policy.selected_positions(100)
+        assert result == [25, 50, 75, 99]
+
+    def test_quartiles_labels(self):
+        policy = SamplingPolicy(position_preset="quartiles")
+        labels = policy.position_labels(100)
+        assert labels == {"q25": 25, "q50": 50, "q75": 75, "q100": 99}
+
+    def test_position_labels_none_without_preset(self):
+        policy = SamplingPolicy()
+        assert policy.position_labels(100) is None
+
+    def test_position_labels_none_empty_sequence(self):
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.position_labels(0) is None
+
+    def test_preset_with_max_tokens(self):
+        policy = SamplingPolicy(
+            position_preset="atlas", max_tokens_per_sample=2
+        )
+        result = policy.selected_positions(100)
+        assert len(result) == 2
+
+    def test_labels_respect_max_tokens(self):
+        """position_labels must match selected_positions when capped."""
+        policy = SamplingPolicy(
+            position_preset="atlas", max_tokens_per_sample=2
+        )
+        positions = policy.selected_positions(100)
+        labels = policy.position_labels(100)
+        assert len(labels) == 2
+        assert list(labels.values()) == positions

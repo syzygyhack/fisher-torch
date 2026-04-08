@@ -8,6 +8,7 @@ import torch
 
 from fisher_torch.extractors import (
     extract_attention,
+    extract_hidden_states,
     extract_layerwise_predictions,
     extract_predictions,
     extract_routing,
@@ -33,18 +34,17 @@ def _make_logits(batch: int = 1) -> torch.Tensor:
     return logits
 
 
-def _make_attention() -> tuple[torch.Tensor, ...]:
+def _make_attention(batch: int = 1) -> tuple[torch.Tensor, ...]:
     """Create attention weight tuple, one per layer.
 
-    Each tensor: (1, n_heads, seq_len, seq_len).
+    Each tensor: (batch, n_heads, seq_len, seq_len).
     Rows already sum to 1 (softmax output).
     """
     torch.manual_seed(1)
     layers = []
     for _ in range(N_LAYERS):
-        raw = torch.randn(1, N_HEADS, SEQ_LEN, SEQ_LEN)
-        attn = torch.softmax(raw, dim=-1)
-        layers.append(attn)
+        raw = torch.randn(batch, N_HEADS, SEQ_LEN, SEQ_LEN)
+        layers.append(torch.softmax(raw, dim=-1))
     return tuple(layers)
 
 
@@ -65,15 +65,15 @@ def _make_causal_attention() -> tuple[torch.Tensor, ...]:
     return tuple(layers)
 
 
-def _make_hidden_states() -> tuple[torch.Tensor, ...]:
+def _make_hidden_states(batch: int = 1) -> tuple[torch.Tensor, ...]:
     """Create hidden state tuple, one per layer.
 
-    Each tensor: (1, seq_len, hidden_dim).
+    Each tensor: (batch, seq_len, hidden_dim).
     """
     torch.manual_seed(2)
     hidden_dim = 64
     return tuple(
-        torch.randn(1, SEQ_LEN, hidden_dim) for _ in range(N_LAYERS)
+        torch.randn(batch, SEQ_LEN, hidden_dim) for _ in range(N_LAYERS)
     )
 
 
@@ -131,7 +131,6 @@ class TestExtractPredictions:
         logits = _make_logits()
         low_temp = extract_predictions(logits, temperature=0.1)
         high_temp = extract_predictions(logits, temperature=10.0)
-        # Higher temperature → more uniform → lower max probability
         assert high_temp.max() < low_temp.max()
 
     def test_remainder_mode_renormalize(self):
@@ -139,7 +138,7 @@ class TestExtractPredictions:
         result = extract_predictions(
             logits, top_k=10, remainder_mode="renormalize"
         )
-        assert result.shape == (SEQ_LEN, 10)  # K only
+        assert result.shape == (SEQ_LEN, 10)
         _is_valid_simplex(result)
 
     def test_multi_batch(self):
@@ -147,20 +146,28 @@ class TestExtractPredictions:
         logits = _make_logits(batch=3)
         result = extract_predictions(logits)
         assert result.shape == (3, SEQ_LEN, VOCAB_SIZE)
-        # Each row should be a valid simplex
         for b in range(3):
             _is_valid_simplex(result[b])
 
     def test_known_tail_shape(self):
         logits = _make_logits()
         result = extract_predictions(
-            logits,
-            top_k=10,
-            remainder_mode="known_tail",
+            logits, top_k=10, remainder_mode="known_tail",
             tail_cardinality=90,
         )
-        assert result.shape == (SEQ_LEN, 10 + 90)  # K + tail_cardinality
+        assert result.shape == (SEQ_LEN, 100)
         _is_valid_simplex(result)
+
+    def test_return_tensors(self):
+        logits = _make_logits()
+        result = extract_predictions(logits, return_tensors=True)
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (SEQ_LEN, VOCAB_SIZE)
+
+    def test_return_tensors_with_topk_raises(self):
+        logits = _make_logits()
+        with pytest.raises(ValueError, match="top_k is not supported"):
+            extract_predictions(logits, top_k=10, return_tensors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -179,16 +186,14 @@ class TestExtractAttention:
     def test_keys_are_layer_indices(self):
         attn = _make_attention()
         result = extract_attention(attn)
-        # Default policy: all layers
         assert set(result.keys()) == {0, 1, 2, 3}
 
     def test_values_are_valid_simplex(self):
         attn = _make_attention()
         result = extract_attention(attn)
-        for layer_idx, arr in result.items():
+        for arr in result.values():
             assert isinstance(arr, np.ndarray)
             assert arr.dtype == np.float64
-            # Each row should sum to 1
             sums = arr.sum(axis=-1)
             np.testing.assert_allclose(sums, 1.0, atol=1e-6)
 
@@ -199,11 +204,9 @@ class TestExtractAttention:
         assert set(result.keys()) == {0, 2}
 
     def test_default_policy_final_token(self):
-        """Default policy: final_token_only → one position per layer."""
         attn = _make_attention()
         result = extract_attention(attn)
         for arr in result.values():
-            # With all heads and final_token_only, we get (n_heads, seq_len)
             assert arr.shape[-1] == SEQ_LEN
 
     def test_policy_selects_heads(self):
@@ -211,43 +214,71 @@ class TestExtractAttention:
         policy = SamplingPolicy(heads=[0, 2])
         result = extract_attention(attn, policy=policy)
         for arr in result.values():
-            # Only 2 heads selected, with final_token_only → (2, seq_len)
             assert arr.shape[0] == 2
 
-    def test_batch_gt1_raises(self):
-        """Batch > 1 is not supported for attention extraction."""
-        torch.manual_seed(1)
-        attn = torch.softmax(
-            torch.randn(2, N_HEADS, SEQ_LEN, SEQ_LEN), dim=-1
-        )
-        with pytest.raises(ValueError, match="Batch size"):
-            extract_attention((attn,))
+    def test_batch_gt1_returns_list(self):
+        """Batch > 1 returns a list of dicts."""
+        attn = _make_attention(batch=2)
+        result = extract_attention(attn)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        for d in result:
+            assert isinstance(d, dict)
+            assert set(d.keys()) == {0, 1, 2, 3}
+
+    def test_batch_gt1_valid_simplices(self):
+        attn = _make_attention(batch=3)
+        result = extract_attention(attn)
+        for d in result:
+            for arr in d.values():
+                _is_valid_simplex(arr)
 
     def test_causal_trim_final_token_unchanged(self):
-        """Causal trim should not change shape for final-token extraction."""
         attn = _make_causal_attention()
         result = extract_attention(attn, causal=True)
         for arr in result.values():
-            # Final token attends to all positions → full row
             assert arr.shape[-1] == SEQ_LEN
             _is_valid_simplex(arr)
 
     def test_causal_trim_non_final_position(self):
-        """Extracting at position 4 with causal=True → shape (n_heads, 5)."""
         attn = _make_causal_attention()
         policy = SamplingPolicy(final_token_only=False, positions=[4])
         result = extract_attention(attn, policy=policy, causal=True)
         for arr in result.values():
-            assert arr.shape == (N_HEADS, 5)  # positions 0-4
+            assert arr.shape == (N_HEADS, 5)
             _is_valid_simplex(arr)
 
     def test_causal_false_preserves_full_row(self):
-        """causal=False keeps the full seq_len-wide row."""
         attn = _make_causal_attention()
         policy = SamplingPolicy(final_token_only=False, positions=[4])
         result = extract_attention(attn, policy=policy, causal=False)
         for arr in result.values():
             assert arr.shape == (N_HEADS, SEQ_LEN)
+
+    def test_return_tensors(self):
+        attn = _make_attention()
+        result = extract_attention(attn, return_tensors=True)
+        assert isinstance(result, dict)
+        for v in result.values():
+            assert isinstance(v, torch.Tensor)
+
+    def test_empty_heads_selection(self):
+        """Empty heads list should return empty arrays, not crash."""
+        attn = _make_attention()
+        policy = SamplingPolicy(heads=[])
+        result = extract_attention(attn, policy=policy)
+        for arr in result.values():
+            assert arr.shape[0] == 0
+
+    def test_empty_positions_selection(self):
+        """Empty positions should return empty arrays."""
+        attn = _make_attention()
+        policy = SamplingPolicy(
+            final_token_only=False, positions=[],
+        )
+        result = extract_attention(attn, policy=policy)
+        for arr in result.values():
+            assert arr.shape[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -301,18 +332,20 @@ class TestExtractLayerwisePredictions:
         policy = SamplingPolicy(top_k=10)
         result = extract_layerwise_predictions(hidden, lm_head, policy=policy)
         for d in result:
-            assert d["predictions"].shape[-1] == 11  # K + 1
+            assert d["predictions"].shape[-1] == 11
 
-    def test_batch_gt1_raises(self):
-        """Batch > 1 is not supported for layerwise extraction."""
-        torch.manual_seed(2)
-        hidden = tuple(torch.randn(2, SEQ_LEN, 64) for _ in range(N_LAYERS))
+    def test_batch_gt1_returns_list_of_lists(self):
+        """Batch > 1 returns list[list[dict]]."""
+        hidden = _make_hidden_states(batch=2)
         lm_head = _make_lm_head()
-        with pytest.raises(ValueError, match="Batch size"):
-            extract_layerwise_predictions(hidden, lm_head)
+        result = extract_layerwise_predictions(hidden, lm_head)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        for batch_item in result:
+            assert isinstance(batch_item, list)
+            assert len(batch_item) == N_LAYERS
 
     def test_position_filtering_final_token(self):
-        """Default policy (final_token_only) should return one position."""
         hidden = _make_hidden_states()
         lm_head = _make_lm_head()
         policy = SamplingPolicy(final_token_only=True)
@@ -322,7 +355,6 @@ class TestExtractLayerwisePredictions:
             _is_valid_simplex(d["predictions"])
 
     def test_position_filtering_explicit(self):
-        """Explicit positions should produce matching row count."""
         hidden = _make_hidden_states()
         lm_head = _make_lm_head()
         policy = SamplingPolicy(
@@ -332,6 +364,97 @@ class TestExtractLayerwisePredictions:
         for d in result:
             assert d["predictions"].shape[0] == 3
             _is_valid_simplex(d["predictions"])
+
+    def test_return_tensors(self):
+        hidden = _make_hidden_states()
+        lm_head = _make_lm_head()
+        result = extract_layerwise_predictions(
+            hidden, lm_head, return_tensors=True, no_grad=False,
+        )
+        for d in result:
+            assert isinstance(d["predictions"], torch.Tensor)
+
+    def test_return_tensors_with_topk_raises(self):
+        hidden = _make_hidden_states()
+        lm_head = _make_lm_head()
+        policy = SamplingPolicy(top_k=10)
+        with pytest.raises(ValueError, match="top_k is not supported"):
+            extract_layerwise_predictions(
+                hidden, lm_head, policy=policy, return_tensors=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# extract_hidden_states
+# ---------------------------------------------------------------------------
+
+
+class TestExtractHiddenStates:
+    """Tests for extract_hidden_states."""
+
+    def test_returns_list_of_dicts(self):
+        hidden = _make_hidden_states()
+        result = extract_hidden_states(hidden)
+        assert isinstance(result, list)
+        assert all(isinstance(d, dict) for d in result)
+
+    def test_dict_keys(self):
+        hidden = _make_hidden_states()
+        result = extract_hidden_states(hidden)
+        for d in result:
+            assert "layer" in d
+            assert "hidden_states" in d
+
+    def test_shape_final_token(self):
+        """Default policy: final token only -> (1, hidden_dim) per layer."""
+        hidden = _make_hidden_states()
+        result = extract_hidden_states(hidden)
+        for d in result:
+            assert d["hidden_states"].shape == (1, 64)
+
+    def test_shape_all_positions(self):
+        hidden = _make_hidden_states()
+        policy = SamplingPolicy(final_token_only=False)
+        result = extract_hidden_states(hidden, policy=policy)
+        for d in result:
+            assert d["hidden_states"].shape == (SEQ_LEN, 64)
+
+    def test_layer_selection(self):
+        hidden = _make_hidden_states()
+        policy = SamplingPolicy(layers=[0, 2])
+        result = extract_hidden_states(hidden, policy=policy)
+        assert len(result) == 2
+        assert result[0]["layer"] == 0
+        assert result[1]["layer"] == 2
+
+    def test_position_selection(self):
+        hidden = _make_hidden_states()
+        policy = SamplingPolicy(final_token_only=False, positions=[1, 5])
+        result = extract_hidden_states(hidden, policy=policy)
+        for d in result:
+            assert d["hidden_states"].shape == (2, 64)
+
+    def test_numpy_dtype(self):
+        hidden = _make_hidden_states()
+        result = extract_hidden_states(hidden)
+        for d in result:
+            assert isinstance(d["hidden_states"], np.ndarray)
+            assert d["hidden_states"].dtype == np.float64
+
+    def test_return_tensors(self):
+        hidden = _make_hidden_states()
+        result = extract_hidden_states(hidden, return_tensors=True)
+        for d in result:
+            assert isinstance(d["hidden_states"], torch.Tensor)
+
+    def test_batch_gt1_returns_list_of_lists(self):
+        hidden = _make_hidden_states(batch=2)
+        result = extract_hidden_states(hidden)
+        assert isinstance(result, list)
+        assert len(result) == 2
+        for batch_item in result:
+            assert isinstance(batch_item, list)
+            assert len(batch_item) == N_LAYERS
 
 
 # ---------------------------------------------------------------------------
@@ -357,5 +480,11 @@ class TestExtractRouting:
         t1 = torch.randn(5, 8)
         t2 = torch.randn(3, 8)
         result = extract_routing((t1, t2))
-        assert result.shape == (8, 8)  # 5 + 3 tokens
+        assert result.shape == (8, 8)
         _is_valid_simplex(result)
+
+    def test_return_tensors(self):
+        logits = _make_router_logits()
+        result = extract_routing(logits, return_tensors=True)
+        assert isinstance(result, torch.Tensor)
+        assert result.shape == (SEQ_LEN, 8)

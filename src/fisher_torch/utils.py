@@ -1,9 +1,8 @@
-"""Softmax, top-k simplex, device, and numpy simplex helpers.
+"""Softmax, top-k simplex, and device helpers.
 
 Provides numerically stable softmax with temperature scaling, top-k
 probability selection with multiple remainder-handling modes via
-fisher-simplex, device resolution for ``device_map="auto"`` models,
-and post-extraction simplex utilities (truncation, renormalization).
+fisher-simplex, and device resolution for ``device_map="auto"`` models.
 """
 
 from __future__ import annotations
@@ -15,6 +14,8 @@ import torch
 import torch.nn.functional as F
 from fisher_simplex import topk_to_simplex as _fs_topk_to_simplex
 from torch import Tensor
+
+from fisher_torch.convert import truncate_and_renormalize  # noqa: F401
 
 
 def get_input_device(model) -> torch.device:
@@ -53,56 +54,6 @@ def get_input_device(model) -> torch.device:
     except StopIteration:
         return torch.device("cpu")
 
-def truncate_and_renormalize(
-    simplices: np.ndarray,
-    target_len: int,
-    *,
-    null_threshold: float = 1e-12,
-) -> np.ndarray:
-    """Truncate simplex vectors and renormalize for cross-sequence comparison.
-
-    When comparing attention distributions across sequences of different
-    lengths, truncate to a common length and renormalize so each row
-    is a valid simplex over the shared support.
-
-    Parameters
-    ----------
-    simplices : np.ndarray
-        Simplex array of shape ``(..., seq_len)``.  The typical shape
-        from multi-prompt extraction is
-        ``(n_prompts, n_layers, n_heads, max_seq)``.
-    target_len : int
-        Desired length along the last axis.  Must be ``<= seq_len``.
-    null_threshold : float, optional
-        Rows whose truncated sum falls below this threshold are replaced
-        with the uniform distribution.  Default ``1e-12``.
-
-    Returns
-    -------
-    np.ndarray
-        Float64 array of shape ``(..., target_len)`` with rows summing to 1.
-    """
-    simplices = np.asarray(simplices, dtype=np.float64)
-    current_len = simplices.shape[-1]
-    if target_len > current_len:
-        raise ValueError(
-            f"target_len ({target_len}) exceeds array length ({current_len})."
-        )
-    if target_len == current_len:
-        return simplices.copy()
-
-    trunc = simplices[..., :target_len].copy()
-    row_sums = trunc.sum(axis=-1, keepdims=True)
-
-    # Replace null rows with uniform distribution.
-    null_mask = row_sums.squeeze(-1) < null_threshold
-    if null_mask.any():
-        trunc[null_mask] = 1.0 / target_len
-        row_sums[null_mask[..., np.newaxis]] = 1.0
-
-    trunc /= row_sums
-    return trunc
-
 
 # Matches fisher-simplex convention for negligible probability mass.
 _CLIP_EPSILON = 1e-30
@@ -124,7 +75,11 @@ class TopkResult:
 
 
 def safe_softmax(
-    logits: Tensor, *, temperature: float = 1.0, dim: int = -1
+    logits: Tensor,
+    *,
+    temperature: float = 1.0,
+    dim: int = -1,
+    differentiable: bool = False,
 ) -> Tensor:
     """Numerically stable softmax with temperature scaling.
 
@@ -136,6 +91,10 @@ def safe_softmax(
         Temperature divisor applied before softmax. Default ``1.0``.
     dim : int, optional
         Dimension along which to compute softmax. Default ``-1``.
+    differentiable : bool, optional
+        If ``True``, skip the clip-and-renormalize step so that
+        gradients flow cleanly through the output.  Default
+        ``False``.
 
     Returns
     -------
@@ -151,10 +110,17 @@ def safe_softmax(
     # ensures consistent behaviour across backends).
     scaled = scaled - scaled.max(dim=dim, keepdim=True).values
     probs = F.softmax(scaled, dim=dim)
-    # Clip denormalized floats to exact zero.
-    probs = torch.where(probs < _CLIP_EPSILON, torch.zeros_like(probs), probs)
-    # Renormalize after clipping to maintain valid distribution.
-    probs = probs / probs.sum(dim=dim, keepdim=True)
+
+    if not differentiable:
+        # Clip denormalized floats to exact zero.
+        probs = torch.where(
+            probs < _CLIP_EPSILON,
+            torch.zeros_like(probs),
+            probs,
+        )
+        # Renormalize after clipping to maintain valid distribution.
+        probs = probs / probs.sum(dim=dim, keepdim=True)
+
     return probs
 
 

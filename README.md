@@ -35,12 +35,49 @@ result = capture_forward(model, input_ids, predictions=True, policy=policy)
 # result.projection_spec describes the projection geometry
 ```
 
+### Multi-prompt batch extraction
+
+```python
+from fisher_torch import capture_batch, SamplingPolicy
+
+prompts = [tokenizer.encode(p, return_tensors="pt") for p in texts]
+policy = SamplingPolicy(position_preset="atlas")
+batch = capture_batch(model, prompts, attention=True, policy=policy)
+# batch.aligned_attention.shape ==
+#   (n_prompts, n_layers, n_heads, n_positions, max_seq_len)
+# batch.metadata["seq_lens"] gives each prompt's valid length
+```
+
+### Gradient-enabled extraction
+
+```python
+result = capture_forward(
+    model, input_ids,
+    predictions=True, attention=True,
+    no_grad=False,
+)
+# result.prediction_tensors — torch.Tensor with grad graph intact
+# result.attention_tensors  — dict[int, Tensor]
+result.detach_to_numpy()  # convert tensor fields to numpy in-place
+```
+
+### Raw hidden states
+
+```python
+result = capture_forward(
+    model, input_ids,
+    predictions=False, hidden_states=True, raw_hidden_states=True,
+)
+# result.hidden_states     — logit-lens projected predictions per layer
+# result.raw_hidden_states — raw vectors without lm_head projection
+```
+
 ## Modules
 
 | Module | Purpose |
 |--------|---------|
 | `extractors` | Stateless functions: logits, attention, hidden states, routing → simplex arrays |
-| `capture` | Single forward pass orchestrator (`capture_forward`) |
-| `convert` | Tensor ↔ numpy simplex array conversion |
-| `sampling` | `SamplingPolicy` — controls which layers, heads, positions to extract |
-| `utils` | Numerically stable softmax, top-k simplex projection |
+| `capture` | `capture_forward` (single pass) and `capture_batch` (multi-prompt with alignment) |
+| `convert` | Tensor ↔ numpy simplex conversion, `stack_attention`, `truncate_and_renormalize` |
+| `sampling` | `SamplingPolicy` — layers, heads, positions, presets (`"atlas"`, `"quartiles"`) |
+| `utils` | Numerically stable softmax, top-k simplex projection, device helpers |
