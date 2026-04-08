@@ -29,7 +29,7 @@ from fisher_torch.utils import (
     topk_softmax,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     # convert

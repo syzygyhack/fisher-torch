@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+### Docs
+
+- README and CHANGELOG updated for v0.3.0 features (missed in initial
+  0.3.0 build uploaded to PyPI).
+
 ## 0.3.0
 
 ### New features
