@@ -2,9 +2,7 @@
 
 Extract simplex arrays from PyTorch model outputs.
 
-Part of the [Fisher stack](https://github.com/syzygy/fisher-simplex) — built on
-[fisher-simplex](https://github.com/syzygy/fisher-simplex) for simplex geometry
-and invariants.
+Built on [fisher-simplex](https://github.com/syzygyhack/fisher-simplex) for simplex geometry and invariants.
 
 ## Install
 
