@@ -35,6 +35,17 @@ result = capture_forward(model, input_ids, predictions=True, policy=policy)
 # result.projection_spec describes the projection geometry
 ```
 
+### Atlas extraction (convenience)
+
+```python
+from fisher_torch import extract_for_atlas
+
+attention, seq_lens = extract_for_atlas(model, tokenizer, texts, layers=[0, 15, 31])
+# attention.shape == (n_prompts, n_positions, n_layers, n_heads, max_seq_len)
+# attention.dtype == np.float64
+# seq_lens gives each prompt's valid token count
+```
+
 ### Multi-prompt batch extraction
 
 ```python
@@ -77,7 +88,7 @@ result = capture_forward(
 | Module | Purpose |
 |--------|---------|
 | `extractors` | Stateless functions: logits, attention, hidden states, routing → simplex arrays |
-| `capture` | `capture_forward` (single pass) and `capture_batch` (multi-prompt with alignment) |
+| `capture` | `capture_forward` (single pass), `capture_batch` (multi-prompt with alignment), `extract_for_atlas` (convenience) |
 | `convert` | Tensor ↔ numpy simplex conversion, `stack_attention`, `truncate_and_renormalize` |
 | `sampling` | `SamplingPolicy` — layers, heads, positions, presets (`"atlas"`, `"quartiles"`) |
 | `utils` | Numerically stable softmax, top-k simplex projection, device helpers |

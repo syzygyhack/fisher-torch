@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0
+
+### New features
+
+- **`extract_for_atlas` convenience function.**  Single call: model +
+  tokenizer + prompts + target layers in, dense float64 array of shape
+  `(n_prompts, n_positions, n_layers, n_heads, max_seq_len)` + seq_lens
+  out.  Replaces the duplicated tokenize-batch-transpose loop across
+  replay scripts.
+
+### Tests
+
+- Atlas position preset edge-case tests at seq_len 1, 2, 5, 8, 128,
+  512 — locks down the `early/mid/late/final` formula and deduplication
+  behavior.
+- Attention float64 guarantee test on the numpy path.
+
+### Docs
+
+- `CaptureResult` and `capture_forward` docstrings now document the
+  float64 guarantee: all numpy arrays on the `no_grad=True` path are
+  float64, enforced by `to_simplex_array`.
+
 ## 0.2.0
 
 ### Breaking changes
