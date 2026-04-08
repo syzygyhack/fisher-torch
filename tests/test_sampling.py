@@ -18,6 +18,18 @@ class TestSamplingPolicyDefaults:
         policy = SamplingPolicy()
         assert policy.remainder_mode == "single_remainder"
 
+    def test_default_tail_cardinality(self):
+        policy = SamplingPolicy()
+        assert policy.tail_cardinality is None
+
+    def test_tail_cardinality_set(self):
+        policy = SamplingPolicy(
+            top_k=10,
+            remainder_mode="known_tail",
+            tail_cardinality=990,
+        )
+        assert policy.tail_cardinality == 990
+
 
 class TestSelectedLayers:
     """Tests for selected_layers."""

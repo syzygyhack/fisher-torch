@@ -1,8 +1,9 @@
-"""Softmax and top-k simplex helpers.
+"""Softmax, top-k simplex, device, and numpy simplex helpers.
 
-Provides numerically stable softmax with temperature scaling and
-top-k probability selection with multiple remainder-handling modes
-via fisher-simplex.
+Provides numerically stable softmax with temperature scaling, top-k
+probability selection with multiple remainder-handling modes via
+fisher-simplex, device resolution for ``device_map="auto"`` models,
+and post-extraction simplex utilities (truncation, renormalization).
 """
 
 from __future__ import annotations
@@ -14,6 +15,94 @@ import torch
 import torch.nn.functional as F
 from fisher_simplex import topk_to_simplex as _fs_topk_to_simplex
 from torch import Tensor
+
+
+def get_input_device(model) -> torch.device:
+    """Resolve the device that *model* expects for input tensors.
+
+    Handles ``device_map="auto"`` models where different layers live on
+    different devices — input tensors must be placed on the device of
+    the embedding layer.
+
+    Resolution order:
+
+    1. ``model.get_input_embeddings()`` parameter device
+    2. ``next(model.parameters())`` device
+    3. ``torch.device("cpu")`` (fallback)
+
+    Parameters
+    ----------
+    model
+        A HuggingFace ``PreTrainedModel`` or compatible object.
+
+    Returns
+    -------
+    torch.device
+    """
+    # Try HuggingFace's standard accessor first.
+    get_embed = getattr(model, "get_input_embeddings", None)
+    if get_embed is not None:
+        try:
+            return next(get_embed().parameters()).device
+        except (StopIteration, AttributeError):
+            pass
+
+    # Fallback: first parameter in the model.
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+def truncate_and_renormalize(
+    simplices: np.ndarray,
+    target_len: int,
+    *,
+    null_threshold: float = 1e-12,
+) -> np.ndarray:
+    """Truncate simplex vectors and renormalize for cross-sequence comparison.
+
+    When comparing attention distributions across sequences of different
+    lengths, truncate to a common length and renormalize so each row
+    is a valid simplex over the shared support.
+
+    Parameters
+    ----------
+    simplices : np.ndarray
+        Simplex array of shape ``(..., seq_len)``.  The typical shape
+        from multi-prompt extraction is
+        ``(n_prompts, n_layers, n_heads, max_seq)``.
+    target_len : int
+        Desired length along the last axis.  Must be ``<= seq_len``.
+    null_threshold : float, optional
+        Rows whose truncated sum falls below this threshold are replaced
+        with the uniform distribution.  Default ``1e-12``.
+
+    Returns
+    -------
+    np.ndarray
+        Float64 array of shape ``(..., target_len)`` with rows summing to 1.
+    """
+    simplices = np.asarray(simplices, dtype=np.float64)
+    current_len = simplices.shape[-1]
+    if target_len > current_len:
+        raise ValueError(
+            f"target_len ({target_len}) exceeds array length ({current_len})."
+        )
+    if target_len == current_len:
+        return simplices.copy()
+
+    trunc = simplices[..., :target_len].copy()
+    row_sums = trunc.sum(axis=-1, keepdims=True)
+
+    # Replace null rows with uniform distribution.
+    null_mask = row_sums.squeeze(-1) < null_threshold
+    if null_mask.any():
+        trunc[null_mask] = 1.0 / target_len
+        row_sums[null_mask[..., np.newaxis]] = 1.0
+
+    trunc /= row_sums
+    return trunc
+
 
 # Matches fisher-simplex convention for negligible probability mass.
 _CLIP_EPSILON = 1e-30
@@ -100,7 +189,7 @@ def topk_softmax(
     simplex : Tensor
         Simplex tensor. Shape depends on *remainder_mode*:
         ``(..., K+1)``, ``(..., K)``, or ``(..., K + tail_cardinality)``.
-    spec : ProjectionSpec
+    spec : TopkResult
         Metadata describing the projection applied.
     """
     probs = safe_softmax(logits, temperature=temperature, dim=-1)
@@ -109,6 +198,14 @@ def topk_softmax(
     if k > vocab_size:
         raise ValueError(
             f"top_k ({k}) exceeds vocabulary size ({vocab_size})."
+        )
+
+    if remainder_mode == "known_tail" and (
+        tail_cardinality is None or tail_cardinality < 1
+    ):
+        raise ValueError(
+            f"known_tail mode requires tail_cardinality >= 1, "
+            f"got {tail_cardinality}."
         )
 
     # Select top-k values.

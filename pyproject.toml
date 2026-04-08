@@ -6,9 +6,11 @@ build-backend = "hatchling.build"
 name = "fisher-torch"
 version = "0.1.0"
 description = "Extract simplex arrays from PyTorch model outputs"
+license = "MIT"
+readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "fisher-simplex>=0.3",
+    "fisher-simplex>=0.3.2",
     "torch>=2.0",
     "numpy>=1.21",
 ]

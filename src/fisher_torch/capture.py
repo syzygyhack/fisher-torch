@@ -19,6 +19,7 @@ from fisher_torch.extractors import (
     extract_routing,
 )
 from fisher_torch.sampling import SamplingPolicy
+from fisher_torch.utils import get_input_device
 
 
 @dataclass(frozen=True)
@@ -31,7 +32,7 @@ class ProjectionSpec:
 
     mode: str
     """Projection mode: ``"full"``, ``"single_remainder"``,
-    ``"renormalized"``, or ``"known_tail"``."""
+    ``"renormalize"``, or ``"known_tail"``."""
 
     top_k: int | None = None
     original_dim: int | None = None
@@ -69,6 +70,7 @@ def capture_forward(
     hidden_states: bool = False,
     routing: bool = False,
     policy: SamplingPolicy | None = None,
+    **model_kwargs,
 ) -> CaptureResult:
     """Run a single forward pass and extract simplex-valued outputs.
 
@@ -88,6 +90,9 @@ def capture_forward(
         Extract MoE routing simplices.
     policy : SamplingPolicy or None
         Controls extraction scope (layers, heads, positions, top-k).
+    **model_kwargs
+        Additional keyword arguments forwarded to the model forward call
+        (e.g. ``attention_mask``, ``position_ids``).
 
     Returns
     -------
@@ -96,6 +101,11 @@ def capture_forward(
     """
     if policy is None:
         policy = SamplingPolicy()
+
+    # Auto-move input_ids to the model's input device (handles device_map="auto").
+    target_device = get_input_device(model)
+    if input_ids.device != target_device:
+        input_ids = input_ids.to(target_device)
 
     # Save original config.
     orig_output_attentions = getattr(model.config, "output_attentions", False)
@@ -115,6 +125,7 @@ def capture_forward(
                 input_ids,
                 output_attentions=attention,
                 output_hidden_states=hidden_states,
+                **model_kwargs,
             )
     finally:
         # Always restore original config values.
@@ -130,6 +141,7 @@ def capture_forward(
             outputs.logits,
             top_k=top_k,
             remainder_mode=policy.remainder_mode,
+            tail_cardinality=policy.tail_cardinality,
         )
 
     # Extract attention.
@@ -139,13 +151,18 @@ def capture_forward(
         )
 
     # Extract hidden states (logit lens).
+    # HuggingFace outputs.hidden_states includes the embedding at index 0;
+    # skip it so layer indices match transformer layers.
     if (
         hidden_states
         and hasattr(outputs, "hidden_states")
         and outputs.hidden_states is not None
     ):
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None and hasattr(model, "get_output_embeddings"):
+            lm_head = model.get_output_embeddings()
         result.hidden_states = extract_layerwise_predictions(
-            outputs.hidden_states, model.lm_head, policy=policy
+            outputs.hidden_states[1:], lm_head, policy=policy
         )
 
     # Extract routing weights.
@@ -156,33 +173,50 @@ def capture_forward(
     ):
         result.routing = extract_routing(outputs.router_logits)
 
-    # Build projection spec.
-    vocab_size = getattr(model.config, "vocab_size", None)
-    top_k = policy.top_k
-    if top_k is not None:
-        mode = policy.remainder_mode
-        simplex_dim = top_k + 1 if mode == "single_remainder" else top_k
-    else:
-        mode = "full"
-        simplex_dim = vocab_size or 0
+    # Build projection spec (only meaningful when simplex data is extracted).
+    if result.predictions is not None or result.hidden_states is not None:
+        vocab_size = getattr(model.config, "vocab_size", None)
+        top_k = policy.top_k
+        tail_cardinality = policy.tail_cardinality
+        if top_k is not None:
+            mode = policy.remainder_mode
+            if mode == "single_remainder":
+                simplex_dim = top_k + 1
+            elif mode == "known_tail" and tail_cardinality is not None:
+                simplex_dim = top_k + tail_cardinality
+            else:
+                simplex_dim = top_k
+        else:
+            mode = "full"
+            simplex_dim = vocab_size or 0
 
-    result.projection_spec = ProjectionSpec(
-        mode=mode,
-        top_k=top_k,
-        original_dim=vocab_size,
-        simplex_dim=simplex_dim,
-    )
+        result.projection_spec = ProjectionSpec(
+            mode=mode,
+            top_k=top_k,
+            original_dim=vocab_size,
+            tail_cardinality=tail_cardinality,
+            simplex_dim=simplex_dim,
+        )
 
     # Build metadata.
     device = getattr(model, "device", torch.device("cpu"))
     seq_len = input_ids.shape[-1] if input_ids.ndim > 0 else 0
     n_layers = getattr(model.config, "num_hidden_layers", None)
+    meta_vocab_size = getattr(model.config, "vocab_size", None)
+    n_heads = getattr(model.config, "num_attention_heads", None)
+    n_kv_heads = getattr(model.config, "num_key_value_heads", n_heads)
+    gqa_group_size = (
+        n_heads // n_kv_heads if n_heads and n_kv_heads else 1
+    )
 
     result.metadata = {
         "device": str(device),
         "seq_len": seq_len,
-        "vocab_size": vocab_size,
+        "vocab_size": meta_vocab_size,
         "n_layers": n_layers,
+        "n_heads": n_heads,
+        "n_kv_heads": n_kv_heads,
+        "gqa_group_size": gqa_group_size,
         "model_class": type(model).__name__,
     }
 

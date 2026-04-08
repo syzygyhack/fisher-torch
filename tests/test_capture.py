@@ -71,6 +71,11 @@ def _mock_model(
     torch.manual_seed(42)
     model.lm_head = torch.nn.Linear(HIDDEN_DIM, VOCAB_SIZE, bias=False)
 
+    # Input embeddings (for get_input_device resolution)
+    model.get_input_embeddings = MagicMock(
+        return_value=torch.nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
+    )
+
     # device
     type(model).device = PropertyMock(return_value=torch.device("cpu"))
 
@@ -219,6 +224,27 @@ class TestCaptureForward:
         assert "vocab_size" in result.metadata
         assert "n_layers" in result.metadata
 
+    def test_metadata_gqa_fields(self):
+        """metadata should include n_heads, n_kv_heads, gqa_group_size."""
+        model = _mock_model()
+        model.config.num_key_value_heads = 2  # GQA: 4 Q-heads, 2 KV-heads
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids)
+        assert result.metadata["n_heads"] == N_HEADS
+        assert result.metadata["n_kv_heads"] == 2
+        assert result.metadata["gqa_group_size"] == 2  # 4 // 2
+
+    def test_metadata_gqa_no_kv_heads(self):
+        """When num_key_value_heads is absent, n_kv_heads == n_heads (MHA)."""
+        model = _mock_model()
+        # Remove num_key_value_heads if set
+        del model.config.num_key_value_heads
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(model, input_ids)
+        assert result.metadata["n_heads"] == N_HEADS
+        assert result.metadata["n_kv_heads"] == N_HEADS
+        assert result.metadata["gqa_group_size"] == 1
+
     def test_nothing_requested(self):
         """If nothing requested, all fields are None."""
         model = _mock_model()
@@ -235,3 +261,115 @@ class TestCaptureForward:
         assert result.attention is None
         assert result.hidden_states is None
         assert result.routing is None
+
+    def test_projection_spec_known_tail(self):
+        """known_tail mode: simplex_dim = K + tail_cardinality."""
+        model = _mock_model()
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        policy = SamplingPolicy(
+            top_k=10,
+            remainder_mode="known_tail",
+            tail_cardinality=90,
+        )
+        result = capture_forward(
+            model, input_ids, predictions=True, policy=policy
+        )
+        assert result.projection_spec.mode == "known_tail"
+        assert result.projection_spec.top_k == 10
+        assert result.projection_spec.tail_cardinality == 90
+        assert result.projection_spec.simplex_dim == 100  # 10 + 90
+
+    def test_projection_spec_renormalize(self):
+        """renormalize mode: simplex_dim = K."""
+        model = _mock_model()
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        policy = SamplingPolicy(top_k=10, remainder_mode="renormalize")
+        result = capture_forward(
+            model, input_ids, predictions=True, policy=policy
+        )
+        assert result.projection_spec.mode == "renormalize"
+        assert result.projection_spec.simplex_dim == 10
+
+    def test_hidden_states_skip_embedding(self):
+        """hidden_states[0] is the embedding; layer indices should match
+        transformer layers, not include the embedding."""
+        model = _mock_model(output_hidden_states=True)
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model, input_ids, predictions=False, hidden_states=True
+        )
+        # N_LAYERS transformer layers (not N_LAYERS + 1 including embedding)
+        assert len(result.hidden_states) == N_LAYERS
+        assert result.hidden_states[0]["layer"] == 0
+        assert result.hidden_states[-1]["layer"] == N_LAYERS - 1
+
+    def test_projection_spec_none_for_attention_only(self):
+        """projection_spec should be None when only attention is extracted."""
+        model = _mock_model(output_attentions=True)
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model,
+            input_ids,
+            predictions=False,
+            attention=True,
+            hidden_states=False,
+        )
+        assert result.attention is not None
+        assert result.projection_spec is None
+
+    def test_model_kwargs_passed_through(self):
+        """Extra kwargs (e.g. attention_mask) should reach the model."""
+        model = _mock_model()
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        mask = torch.ones(1, SEQ_LEN, dtype=torch.long)
+
+        # Replace __call__ with one that records kwargs
+        received = {}
+
+        def tracking_forward(input_ids, **kwargs):
+            received.update(kwargs)
+            return _mock_model_output()
+
+        model.side_effect = tracking_forward
+        model.__call__ = tracking_forward
+
+        capture_forward(model, input_ids, attention_mask=mask)
+        assert "attention_mask" in received
+        assert torch.equal(received["attention_mask"], mask)
+
+    def test_auto_moves_input_to_model_device(self):
+        """input_ids should be auto-moved to the model's input device."""
+        model = _mock_model()
+        # Model embedding is on CPU; input_ids also on CPU.
+        # Verify the forward call receives input_ids (no device mismatch).
+        received_devices = []
+
+        def tracking_forward(input_ids, **kwargs):
+            received_devices.append(input_ids.device)
+            return _mock_model_output()
+
+        model.__call__ = tracking_forward
+        model.side_effect = tracking_forward
+
+        # Provide a real embedding so get_input_device can resolve
+        embed = torch.nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
+        model.get_input_embeddings = MagicMock(return_value=embed)
+
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        capture_forward(model, input_ids)
+        assert received_devices[0] == torch.device("cpu")
+
+    def test_get_output_embeddings_fallback(self):
+        """When model has no lm_head, fall back to get_output_embeddings()."""
+        model = _mock_model(output_hidden_states=True)
+        # Move lm_head to get_output_embeddings and remove the attribute
+        lm_head = model.lm_head
+        del model.lm_head
+        model.get_output_embeddings = MagicMock(return_value=lm_head)
+
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model, input_ids, predictions=False, hidden_states=True
+        )
+        assert result.hidden_states is not None
+        model.get_output_embeddings.assert_called_once()

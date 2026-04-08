@@ -32,6 +32,51 @@ def to_simplex_array(tensor: Tensor, *, dim: int = -1) -> NDArray[np.floating]:
     return validate_simplex(arr, axis=dim, renormalize="warn")
 
 
+def stack_attention(
+    attention: dict[int, np.ndarray],
+    *,
+    n_heads: int,
+) -> np.ndarray:
+    """Stack a per-layer attention dict into a dense array.
+
+    Converts the ``dict[int, np.ndarray]`` returned by
+    :func:`~fisher_torch.extractors.extract_attention` into a single
+    array suitable for vectorised geometry operations.
+
+    Parameters
+    ----------
+    attention : dict[int, np.ndarray]
+        Mapping from layer index to array of shape
+        ``(n_heads * n_positions, seq_len)``.
+    n_heads : int
+        Number of attention heads (used to reshape rows).
+
+    Returns
+    -------
+    np.ndarray
+        If each layer has a single query position (the default
+        ``final_token_only`` mode), returns shape
+        ``(n_layers, n_heads, seq_len)``.
+
+        Otherwise returns ``(n_layers, n_heads, n_positions, seq_len)``.
+    """
+    layers = sorted(attention.keys())
+    arrays = []
+    for layer_idx in layers:
+        arr = attention[layer_idx]  # (n_heads * n_positions, seq_len)
+        n_rows, seq_len = arr.shape
+        n_positions = n_rows // n_heads
+        arrays.append(arr.reshape(n_heads, n_positions, seq_len))
+
+    stacked = np.stack(arrays, axis=0)  # (n_layers, n_heads, n_positions, seq_len)
+
+    # Squeeze single-position dimension for the common final-token case.
+    if stacked.shape[2] == 1:
+        stacked = stacked.squeeze(2)
+
+    return stacked
+
+
 def from_simplex_array(
     array: np.ndarray,
     *,

@@ -86,6 +86,9 @@ class TestFullCaptureMock:
 
         torch.manual_seed(42)
         model.lm_head = torch.nn.Linear(HIDDEN_DIM, VOCAB_SIZE, bias=False)
+        model.get_input_embeddings = MagicMock(
+            return_value=torch.nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
+        )
         type(model).device = PropertyMock(return_value=torch.device("cpu"))
 
         def forward_fn(input_ids, **kwargs):

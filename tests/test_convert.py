@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from fisher_torch.convert import from_simplex_array, to_simplex_array
+from fisher_torch.convert import from_simplex_array, stack_attention, to_simplex_array
+from fisher_torch.utils import truncate_and_renormalize
 
 
 class TestToSimplexArray:
@@ -99,3 +100,91 @@ class TestRoundtrip:
         arr = to_simplex_array(original)
         recovered = from_simplex_array(arr, dtype=torch.float64)
         torch.testing.assert_close(recovered, original)
+
+
+class TestStackAttention:
+    """Tests for stack_attention."""
+
+    def test_single_position_squeeze(self):
+        """With 1 position per head, result is (n_layers, n_heads, seq_len)."""
+        n_heads, seq_len = 4, 10
+        attn = {
+            0: np.random.dirichlet(np.ones(seq_len), size=n_heads),
+            2: np.random.dirichlet(np.ones(seq_len), size=n_heads),
+        }
+        result = stack_attention(attn, n_heads=n_heads)
+        assert result.shape == (2, n_heads, seq_len)
+
+    def test_multi_position_no_squeeze(self):
+        """With >1 position, result is (n_layers, n_heads, n_positions, seq_len)."""
+        n_heads, n_positions, seq_len = 4, 3, 10
+        attn = {
+            0: np.random.dirichlet(
+                np.ones(seq_len), size=n_heads * n_positions
+            ),
+        }
+        result = stack_attention(attn, n_heads=n_heads)
+        assert result.shape == (1, n_heads, n_positions, seq_len)
+
+    def test_values_preserved(self):
+        """Values survive the reshape correctly."""
+        n_heads = 2
+        layer0 = np.array([
+            [0.5, 0.1, 0.1, 0.1, 0.2],  # head 0
+            [0.2, 0.2, 0.2, 0.2, 0.2],  # head 1
+        ])
+        attn = {0: layer0}
+        result = stack_attention(attn, n_heads=n_heads)
+        np.testing.assert_array_equal(result[0, 0], layer0[0])
+        np.testing.assert_array_equal(result[0, 1], layer0[1])
+
+    def test_layer_order_sorted(self):
+        """Layers appear in sorted key order regardless of dict insertion."""
+        n_heads, seq_len = 2, 4
+        layer5 = np.random.dirichlet(np.ones(seq_len), size=n_heads)
+        layer2 = np.random.dirichlet(np.ones(seq_len), size=n_heads)
+        attn = {5: layer5, 2: layer2}
+        result = stack_attention(attn, n_heads=n_heads)
+        # Index 0 should be layer 2, index 1 should be layer 5
+        np.testing.assert_array_equal(result[0], layer2.reshape(n_heads, seq_len))
+        np.testing.assert_array_equal(result[1], layer5.reshape(n_heads, seq_len))
+
+
+class TestTruncateAndRenormalize:
+    """Tests for truncate_and_renormalize."""
+
+    def test_truncate_shorter(self):
+        """Truncate from length 10 to 5."""
+        rng = np.random.default_rng(42)
+        arr = rng.dirichlet(np.ones(10), size=3)
+        result = truncate_and_renormalize(arr, 5)
+        assert result.shape == (3, 5)
+
+    def test_renormalize_after_truncate(self):
+        """Rows should sum to 1 after truncation."""
+        rng = np.random.default_rng(42)
+        arr = rng.dirichlet(np.ones(10), size=3)
+        result = truncate_and_renormalize(arr, 5)
+        np.testing.assert_allclose(result.sum(axis=-1), 1.0, atol=1e-12)
+
+    def test_null_row_uniform_fallback(self):
+        """A zero row should become uniform after truncation."""
+        arr = np.zeros((2, 10))
+        arr[0] = np.ones(10) / 10  # valid row
+        # arr[1] stays all-zero
+        result = truncate_and_renormalize(arr, 5)
+        np.testing.assert_allclose(result[1], 1.0 / 5, atol=1e-12)
+
+    def test_no_truncation_when_same_length(self):
+        """If target_len == array length, just copy (already valid)."""
+        rng = np.random.default_rng(42)
+        arr = rng.dirichlet(np.ones(5), size=3)
+        result = truncate_and_renormalize(arr, 5)
+        np.testing.assert_allclose(result, arr, atol=1e-12)
+
+    def test_1d_input(self):
+        """Single simplex vector (1D) should work."""
+        arr = np.array([0.4, 0.3, 0.2, 0.1])
+        result = truncate_and_renormalize(arr, 2)
+        assert result.shape == (2,)
+        np.testing.assert_allclose(result.sum(), 1.0, atol=1e-12)

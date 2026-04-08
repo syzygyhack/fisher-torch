@@ -22,6 +22,7 @@ def extract_predictions(
     temperature: float = 1.0,
     top_k: int | None = None,
     remainder_mode: str = "single_remainder",
+    tail_cardinality: int | None = None,
 ) -> np.ndarray:
     """Convert logits to a validated simplex array.
 
@@ -38,6 +39,8 @@ def extract_predictions(
     remainder_mode : str, optional
         How to handle tail mass when *top_k* is set.  Default
         ``"single_remainder"``.
+    tail_cardinality : int or None, optional
+        Number of tail bins for ``"known_tail"`` remainder mode.
 
     Returns
     -------
@@ -54,6 +57,7 @@ def extract_predictions(
             top_k,
             temperature=temperature,
             remainder_mode=remainder_mode,
+            tail_cardinality=tail_cardinality,
         )
         return to_simplex_array(simplex_t)
 
@@ -65,6 +69,7 @@ def extract_attention(
     attention_weights: Tensor | tuple[Tensor, ...],
     *,
     policy: SamplingPolicy | None = None,
+    causal: bool = True,
 ) -> dict[int, np.ndarray]:
     """Convert attention weights to simplex arrays keyed by layer.
 
@@ -76,12 +81,23 @@ def extract_attention(
     policy : SamplingPolicy or None, optional
         Controls which layers, heads, and positions to extract.
         Defaults to ``SamplingPolicy()`` (final token only).
+    causal : bool, optional
+        If ``True`` (default), trim each attention row to its causal
+        window ``[:position + 1]``.  This removes the zero-padding
+        from the causal mask, producing a properly-sized simplex.
+
+        When all selected positions share the same causal length
+        (e.g. ``final_token_only``), the output shape is unchanged.
+        When positions have different causal lengths, rows are padded
+        to the length of the longest selected position.
 
     Returns
     -------
     dict[int, np.ndarray]
         Mapping from layer index to float64 simplex array of shape
-        ``(n_selected_heads * n_selected_positions, seq_len)``.
+        ``(n_selected_heads * n_selected_positions, causal_len)``
+        where *causal_len* is ``max(positions) + 1`` when
+        ``causal=True``, or ``seq_len`` when ``causal=False``.
     """
     if policy is None:
         policy = SamplingPolicy()
@@ -98,21 +114,42 @@ def extract_attention(
     heads = policy.selected_heads(n_heads)
     positions = policy.selected_positions(seq_len)
 
+    # Determine output row length.
+    if causal and positions:
+        out_len = max(positions) + 1
+    else:
+        out_len = seq_len
+
     result: dict[int, np.ndarray] = {}
     for layer_idx in layers:
         attn = attention_weights[layer_idx]
         # attn shape: (batch, n_heads, seq_len, seq_len)
-        # Squeeze batch=1.
         if attn.ndim == 4 and attn.shape[0] == 1:
             attn = attn.squeeze(0)  # (n_heads, seq_len, seq_len)
+        elif attn.ndim == 4 and attn.shape[0] > 1:
+            raise ValueError(
+                f"Batch size {attn.shape[0]} > 1 is not supported for "
+                "attention extraction."
+            )
 
         rows = []
         for h in heads:
             for p in positions:
-                # attn[h, p, :] is the attention row — already a simplex.
-                rows.append(attn[h, p, :])
+                if causal:
+                    row = attn[h, p, : p + 1]
+                    # Pad to out_len if needed (multi-position case).
+                    if row.shape[0] < out_len:
+                        pad = torch.zeros(
+                            out_len - row.shape[0],
+                            device=row.device,
+                            dtype=row.dtype,
+                        )
+                        row = torch.cat([row, pad])
+                else:
+                    row = attn[h, p, :]
+                rows.append(row)
 
-        stacked = torch.stack(rows)  # (n_selected, seq_len)
+        stacked = torch.stack(rows)  # (n_selected, out_len)
         result[layer_idx] = to_simplex_array(stacked)
 
     return result
@@ -151,9 +188,17 @@ def extract_layerwise_predictions(
     results = []
     for layer_idx in layers:
         hs = hidden_states[layer_idx]
-        # Squeeze batch=1.
         if hs.ndim == 3 and hs.shape[0] == 1:
             hs = hs.squeeze(0)  # (seq_len, hidden_dim)
+        elif hs.ndim == 3 and hs.shape[0] > 1:
+            raise ValueError(
+                f"Batch size {hs.shape[0]} > 1 is not supported for "
+                "layerwise prediction extraction."
+            )
+
+        # Select positions before projecting through lm_head.
+        positions = policy.selected_positions(hs.shape[0])
+        hs = hs[positions]  # (n_positions, hidden_dim)
 
         with torch.no_grad():
             layer_logits = lm_head(hs)
@@ -163,6 +208,7 @@ def extract_layerwise_predictions(
                 layer_logits,
                 policy.top_k,
                 remainder_mode=policy.remainder_mode,
+                tail_cardinality=policy.tail_cardinality,
             )
             predictions = to_simplex_array(simplex_t)
         else:

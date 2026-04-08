@@ -27,6 +27,7 @@ class SamplingPolicy:
     max_tokens_per_sample: int | None = None
     top_k: int | None = None
     remainder_mode: str = "single_remainder"
+    tail_cardinality: int | None = None
 
     def selected_layers(self, n_layers: int) -> list[int]:
         """Return layer indices to extract.

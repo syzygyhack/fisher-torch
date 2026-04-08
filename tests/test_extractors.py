@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from fisher_torch.extractors import (
@@ -42,6 +43,23 @@ def _make_attention() -> tuple[torch.Tensor, ...]:
     layers = []
     for _ in range(N_LAYERS):
         raw = torch.randn(1, N_HEADS, SEQ_LEN, SEQ_LEN)
+        attn = torch.softmax(raw, dim=-1)
+        layers.append(attn)
+    return tuple(layers)
+
+
+def _make_causal_attention() -> tuple[torch.Tensor, ...]:
+    """Create attention with proper causal mask (zeros above diagonal).
+
+    Each tensor: (1, n_heads, seq_len, seq_len).
+    Position p only attends to positions 0..p.
+    """
+    torch.manual_seed(1)
+    mask = torch.triu(torch.ones(SEQ_LEN, SEQ_LEN), diagonal=1).bool()
+    layers = []
+    for _ in range(N_LAYERS):
+        raw = torch.randn(1, N_HEADS, SEQ_LEN, SEQ_LEN)
+        raw = raw.masked_fill(mask, float("-inf"))
         attn = torch.softmax(raw, dim=-1)
         layers.append(attn)
     return tuple(layers)
@@ -133,6 +151,17 @@ class TestExtractPredictions:
         for b in range(3):
             _is_valid_simplex(result[b])
 
+    def test_known_tail_shape(self):
+        logits = _make_logits()
+        result = extract_predictions(
+            logits,
+            top_k=10,
+            remainder_mode="known_tail",
+            tail_cardinality=90,
+        )
+        assert result.shape == (SEQ_LEN, 10 + 90)  # K + tail_cardinality
+        _is_valid_simplex(result)
+
 
 # ---------------------------------------------------------------------------
 # extract_attention
@@ -184,6 +213,41 @@ class TestExtractAttention:
         for arr in result.values():
             # Only 2 heads selected, with final_token_only → (2, seq_len)
             assert arr.shape[0] == 2
+
+    def test_batch_gt1_raises(self):
+        """Batch > 1 is not supported for attention extraction."""
+        torch.manual_seed(1)
+        attn = torch.softmax(
+            torch.randn(2, N_HEADS, SEQ_LEN, SEQ_LEN), dim=-1
+        )
+        with pytest.raises(ValueError, match="Batch size"):
+            extract_attention((attn,))
+
+    def test_causal_trim_final_token_unchanged(self):
+        """Causal trim should not change shape for final-token extraction."""
+        attn = _make_causal_attention()
+        result = extract_attention(attn, causal=True)
+        for arr in result.values():
+            # Final token attends to all positions → full row
+            assert arr.shape[-1] == SEQ_LEN
+            _is_valid_simplex(arr)
+
+    def test_causal_trim_non_final_position(self):
+        """Extracting at position 4 with causal=True → shape (n_heads, 5)."""
+        attn = _make_causal_attention()
+        policy = SamplingPolicy(final_token_only=False, positions=[4])
+        result = extract_attention(attn, policy=policy, causal=True)
+        for arr in result.values():
+            assert arr.shape == (N_HEADS, 5)  # positions 0-4
+            _is_valid_simplex(arr)
+
+    def test_causal_false_preserves_full_row(self):
+        """causal=False keeps the full seq_len-wide row."""
+        attn = _make_causal_attention()
+        policy = SamplingPolicy(final_token_only=False, positions=[4])
+        result = extract_attention(attn, policy=policy, causal=False)
+        for arr in result.values():
+            assert arr.shape == (N_HEADS, SEQ_LEN)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +302,36 @@ class TestExtractLayerwisePredictions:
         result = extract_layerwise_predictions(hidden, lm_head, policy=policy)
         for d in result:
             assert d["predictions"].shape[-1] == 11  # K + 1
+
+    def test_batch_gt1_raises(self):
+        """Batch > 1 is not supported for layerwise extraction."""
+        torch.manual_seed(2)
+        hidden = tuple(torch.randn(2, SEQ_LEN, 64) for _ in range(N_LAYERS))
+        lm_head = _make_lm_head()
+        with pytest.raises(ValueError, match="Batch size"):
+            extract_layerwise_predictions(hidden, lm_head)
+
+    def test_position_filtering_final_token(self):
+        """Default policy (final_token_only) should return one position."""
+        hidden = _make_hidden_states()
+        lm_head = _make_lm_head()
+        policy = SamplingPolicy(final_token_only=True)
+        result = extract_layerwise_predictions(hidden, lm_head, policy=policy)
+        for d in result:
+            assert d["predictions"].shape[0] == 1
+            _is_valid_simplex(d["predictions"])
+
+    def test_position_filtering_explicit(self):
+        """Explicit positions should produce matching row count."""
+        hidden = _make_hidden_states()
+        lm_head = _make_lm_head()
+        policy = SamplingPolicy(
+            final_token_only=False, positions=[1, 3, 5]
+        )
+        result = extract_layerwise_predictions(hidden, lm_head, policy=policy)
+        for d in result:
+            assert d["predictions"].shape[0] == 3
+            _is_valid_simplex(d["predictions"])
 
 
 # ---------------------------------------------------------------------------

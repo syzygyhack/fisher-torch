@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 import torch
 
-from fisher_torch.utils import TopkResult, safe_softmax, topk_softmax
+from fisher_torch.utils import TopkResult, get_input_device, safe_softmax, topk_softmax
 
 
 class TestSafeSoftmax:
@@ -173,7 +175,47 @@ class TestTopkSoftmax:
         simplex, _ = topk_softmax(logits, 10)
         assert (simplex >= 0).all()
 
+    def test_known_tail_zero_cardinality_raises(self):
+        """known_tail with tail_cardinality=0 should raise, not silently
+        produce a renormalized vector via division by zero."""
+        logits = torch.randn(10, 100)
+        with pytest.raises(ValueError, match="tail_cardinality"):
+            topk_softmax(
+                logits, 10, remainder_mode="known_tail", tail_cardinality=0
+            )
+
+    def test_known_tail_negative_cardinality_raises(self):
+        logits = torch.randn(10, 100)
+        with pytest.raises(ValueError, match="tail_cardinality"):
+            topk_softmax(
+                logits, 10, remainder_mode="known_tail", tail_cardinality=-1
+            )
+
     def test_k_exceeds_vocab_raises(self):
         logits = torch.randn(5)
         with pytest.raises(ValueError, match="exceeds vocabulary size"):
             topk_softmax(logits, 10)
+
+
+class TestGetInputDevice:
+    """Tests for get_input_device."""
+
+    def test_uses_get_input_embeddings(self):
+        """Resolves device via get_input_embeddings() when available."""
+        embed = torch.nn.Embedding(100, 64)  # on CPU
+        model = MagicMock()
+        model.get_input_embeddings = MagicMock(return_value=embed)
+        assert get_input_device(model) == torch.device("cpu")
+
+    def test_falls_back_to_parameters(self):
+        """Falls back to next(model.parameters()) when no get_input_embeddings."""
+        linear = torch.nn.Linear(10, 10)  # on CPU
+        model = MagicMock(spec=[])  # empty spec — no attributes
+        model.parameters = linear.parameters
+        assert get_input_device(model) == torch.device("cpu")
+
+    def test_empty_model_returns_cpu(self):
+        """Returns CPU when model has no parameters at all."""
+        model = MagicMock(spec=[])
+        model.parameters = MagicMock(return_value=iter([]))
+        assert get_input_device(model) == torch.device("cpu")
