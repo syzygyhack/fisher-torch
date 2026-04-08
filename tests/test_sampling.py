@@ -218,3 +218,61 @@ class TestPositionPresets:
         labels = policy.position_labels(100)
         assert len(labels) == 2
         assert list(labels.values()) == positions
+
+
+class TestAtlasEdgeCases:
+    """Verify atlas preset indices at edge-case sequence lengths.
+
+    Formula: early=min(4, n-1), mid=n//2, late=max(n-3, mid+1), final=n-1.
+    Positions are clamped to [0, n-1] and deduplicated (first label wins).
+    """
+
+    def test_seq_len_1(self):
+        """All four positions collapse to 0."""
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.selected_positions(1) == [0]
+        assert policy.position_labels(1) == {"early": 0}
+
+    def test_seq_len_2(self):
+        """All four positions collapse to 1."""
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.selected_positions(2) == [1]
+        assert policy.position_labels(2) == {"early": 1}
+
+    def test_seq_len_5(self):
+        """early=4, mid=2, late=3, final=4 (deduped).
+
+        3 unique positions: early and final collide at index 4.
+        """
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.selected_positions(5) == [4, 2, 3]
+        assert policy.position_labels(5) == {
+            "early": 4, "mid": 2, "late": 3,
+        }
+
+    def test_seq_len_8(self):
+        """early=4, mid=4, late=5, final=7.
+
+        3 unique positions: early and mid collide at index 4.
+        """
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.selected_positions(8) == [4, 5, 7]
+        assert policy.position_labels(8) == {
+            "early": 4, "late": 5, "final": 7,
+        }
+
+    def test_seq_len_128(self):
+        """All four positions are distinct."""
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.selected_positions(128) == [4, 64, 125, 127]
+        assert policy.position_labels(128) == {
+            "early": 4, "mid": 64, "late": 125, "final": 127,
+        }
+
+    def test_seq_len_512(self):
+        """All four positions are distinct."""
+        policy = SamplingPolicy(position_preset="atlas")
+        assert policy.selected_positions(512) == [4, 256, 509, 511]
+        assert policy.position_labels(512) == {
+            "early": 4, "mid": 256, "late": 509, "final": 511,
+        }

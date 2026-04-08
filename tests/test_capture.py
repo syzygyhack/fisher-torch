@@ -14,6 +14,7 @@ from fisher_torch.capture import (
     ProjectionSpec,
     capture_batch,
     capture_forward,
+    extract_for_atlas,
 )
 from fisher_torch.sampling import SamplingPolicy
 
@@ -184,6 +185,18 @@ class TestCaptureForward:
         )
         assert result.attention is not None
         assert isinstance(result.attention, dict)
+
+    def test_attention_float64_guarantee(self):
+        """Attention arrays on the numpy path must be float64."""
+        model = _mock_model(output_attentions=True)
+        input_ids = torch.randint(0, VOCAB_SIZE, (1, SEQ_LEN))
+        result = capture_forward(
+            model, input_ids, predictions=False, attention=True
+        )
+        for layer_idx, arr in result.attention.items():
+            assert arr.dtype == np.float64, (
+                f"Layer {layer_idx} attention is {arr.dtype}, expected float64"
+            )
 
     def test_hidden_states_not_none(self):
         model = _mock_model(output_hidden_states=True)
@@ -621,3 +634,141 @@ class TestCaptureBatch:
         # But per-result tensor fields should still be populated.
         for r in result.results:
             assert r.attention_tensors is not None
+
+
+# ---------------------------------------------------------------------------
+# extract_for_atlas
+# ---------------------------------------------------------------------------
+
+
+def _adaptive_mock_model():
+    """Build a mock model whose output shapes adapt to input seq_len."""
+    model = MagicMock()
+
+    model.config = MagicMock()
+    model.config.vocab_size = VOCAB_SIZE
+    model.config.num_hidden_layers = N_LAYERS
+    model.config.num_attention_heads = N_HEADS
+    model.config.num_key_value_heads = N_HEADS
+    model.config.output_attentions = False
+    model.config.output_hidden_states = False
+    model.is_gradient_checkpointing = False
+
+    torch.manual_seed(42)
+    model.lm_head = torch.nn.Linear(HIDDEN_DIM, VOCAB_SIZE, bias=False)
+    model.get_input_embeddings = MagicMock(
+        return_value=torch.nn.Embedding(VOCAB_SIZE, HIDDEN_DIM)
+    )
+    type(model).device = PropertyMock(return_value=torch.device("cpu"))
+
+    def forward_fn(input_ids, **kwargs):
+        torch.manual_seed(42)
+        seq_len = input_ids.shape[-1]
+        output = MagicMock()
+        output.logits = torch.randn(1, seq_len, VOCAB_SIZE)
+
+        if kwargs.get("output_attentions", False):
+            layers = []
+            for _ in range(N_LAYERS):
+                raw = torch.randn(1, N_HEADS, seq_len, seq_len)
+                layers.append(torch.softmax(raw, dim=-1))
+            output.attentions = tuple(layers)
+        else:
+            output.attentions = None
+
+        output.hidden_states = None
+        output.router_logits = None
+        return output
+
+    model.side_effect = forward_fn
+    model.__call__ = forward_fn
+    return model
+
+
+def _mock_tokenizer(vocab_size: int = VOCAB_SIZE):
+    """Build a mock tokenizer that maps each character to a token ID."""
+    tokenizer = MagicMock()
+
+    def encode(text, return_tensors=None):
+        tokens = [ord(c) % vocab_size for c in text]
+        if return_tensors == "pt":
+            return torch.tensor([tokens])
+        return tokens
+
+    tokenizer.encode = encode
+    return tokenizer
+
+
+class TestExtractForAtlas:
+    """Tests for extract_for_atlas convenience function."""
+
+    def test_returns_tuple(self):
+        """Should return (ndarray, list[int])."""
+        model = _adaptive_mock_model()
+        tokenizer = _mock_tokenizer()
+        prompts = ["hello", "world"]
+        result = extract_for_atlas(model, tokenizer, prompts)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        arr, seq_lens = result
+        assert isinstance(arr, np.ndarray)
+        assert isinstance(seq_lens, list)
+
+    def test_output_shape(self):
+        """Shape must be (n_prompts, n_positions, n_layers, n_heads, max_seq_len)."""
+        model = _adaptive_mock_model()
+        tokenizer = _mock_tokenizer()
+        prompts = ["hello world!!", "test input!!?"]  # len 13 each
+        arr, seq_lens = extract_for_atlas(model, tokenizer, prompts)
+
+        n_prompts = 2
+        max_seq = max(seq_lens)
+        # seq_len=13 atlas: early=4, mid=6, late=10, final=12 → 4 positions
+        n_positions = 4
+        assert arr.shape == (
+            n_prompts, n_positions, N_LAYERS, N_HEADS, max_seq,
+        )
+
+    def test_dtype_float64(self):
+        """Output must be float64."""
+        model = _adaptive_mock_model()
+        tokenizer = _mock_tokenizer()
+        arr, _ = extract_for_atlas(model, tokenizer, ["hello"])
+        assert arr.dtype == np.float64
+
+    def test_seq_lens_correct(self):
+        """seq_lens must match actual tokenized lengths."""
+        model = _adaptive_mock_model()
+        tokenizer = _mock_tokenizer()
+        prompts = ["hi", "hello"]  # 2 and 5 characters
+        _, seq_lens = extract_for_atlas(model, tokenizer, prompts)
+        assert seq_lens == [2, 5]
+
+    def test_layer_selection(self):
+        """Passing layers should filter to those layers only."""
+        model = _adaptive_mock_model()
+        tokenizer = _mock_tokenizer()
+        prompts = ["hello world!!"]  # 13 chars
+        arr, _ = extract_for_atlas(
+            model, tokenizer, prompts, layers=[0, 2],
+        )
+        # 2 layers selected
+        assert arr.shape[2] == 2
+
+    def test_variable_length_prompts(self):
+        """Prompts of different lengths should be padded to max_seq_len."""
+        model = _adaptive_mock_model()
+        tokenizer = _mock_tokenizer()
+        prompts = ["hi", "hello world!!"]  # 2 and 13 chars
+        arr, seq_lens = extract_for_atlas(model, tokenizer, prompts)
+        assert seq_lens == [2, 13]
+        assert arr.shape[0] == 2
+        assert arr.shape[-1] == 13  # max_seq_len
+
+    def test_empty_prompts(self):
+        """Empty prompt list should return empty array and empty seq_lens."""
+        model = _adaptive_mock_model()
+        tokenizer = _mock_tokenizer()
+        arr, seq_lens = extract_for_atlas(model, tokenizer, [])
+        assert arr.size == 0
+        assert seq_lens == []

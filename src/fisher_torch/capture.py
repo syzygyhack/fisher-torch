@@ -54,9 +54,24 @@ class ProjectionSpec:
 
 @dataclass
 class CaptureResult:
-    """Result of a :func:`capture_forward` call."""
+    """Result of a :func:`capture_forward` call.
+
+    **Float64 guarantee (numpy path):** When ``no_grad=True`` (the
+    default), all numpy arrays — ``predictions``, ``attention`` values,
+    ``hidden_states`` prediction entries, and ``routing`` — are
+    ``float64``.  This is enforced by :func:`~fisher_torch.convert.to_simplex_array`
+    and is required for geometric stability in downstream
+    fisher-simplex operations.  The ``raw_hidden_states`` vectors are
+    also ``float64`` (cast explicitly).
+
+    When ``no_grad=False``, the ``*_tensors`` fields hold torch
+    ``Tensor`` objects with the model's native dtype (typically
+    ``float32``).  Call :meth:`detach_to_numpy` to convert them to
+    ``float64`` numpy arrays.
+    """
 
     # Numpy simplex fields (populated in default no_grad=True mode).
+    # All arrays are guaranteed float64.
     predictions: np.ndarray | None = None
     attention: dict[int, np.ndarray] | list[dict[int, np.ndarray]] | None = None
     hidden_states: list[dict] | list[list[dict]] | None = None
@@ -186,7 +201,11 @@ def capture_forward(
     Returns
     -------
     CaptureResult
-        Populated with requested extractions.
+        Populated with requested extractions.  When ``no_grad=True``
+        (the default), all numpy arrays are guaranteed ``float64``.
+        When ``no_grad=False``, the ``*_tensors`` fields hold torch
+        ``Tensor`` objects in the model's native dtype; call
+        :meth:`CaptureResult.detach_to_numpy` to convert to ``float64``.
     """
     if policy is None:
         policy = SamplingPolicy()
@@ -547,3 +566,71 @@ def _align_attention(
         padded.append(s)
 
     return np.stack(padded, axis=0)
+
+
+def extract_for_atlas(
+    model,
+    tokenizer,
+    prompts: list[str],
+    *,
+    layers: list[int] | None = None,
+    **model_kwargs,
+) -> tuple[np.ndarray, list[int]]:
+    """Extract atlas-position attention simplices for multiple prompts.
+
+    Convenience wrapper around :func:`capture_batch` that tokenizes
+    prompts, uses the ``"atlas"`` position preset, and returns a dense
+    float64 array ready for geometric analysis.
+
+    Parameters
+    ----------
+    model
+        A HuggingFace ``PreTrainedModel`` (or compatible mock).
+    tokenizer
+        A HuggingFace tokenizer (or any object whose ``.encode(text,
+        return_tensors="pt")`` returns a ``(1, seq_len)`` tensor).
+    prompts : list[str]
+        Text prompts to process.
+    layers : list[int] or None, optional
+        Which transformer layers to extract.  ``None`` extracts all.
+    **model_kwargs
+        Extra kwargs forwarded to each model forward call
+        (e.g. ``attention_mask``).
+
+    Returns
+    -------
+    attention : np.ndarray
+        Float64 array of shape
+        ``(n_prompts, n_positions, n_layers, n_heads, max_seq_len)``.
+        Padded positions are zero-filled and are **not** valid
+        simplices — use *seq_lens* to identify valid regions.
+    seq_lens : list[int]
+        Token count for each prompt.
+    """
+    if not prompts:
+        return np.empty(0, dtype=np.float64), []
+
+    token_ids = [tokenizer.encode(p, return_tensors="pt") for p in prompts]
+
+    policy = SamplingPolicy(
+        position_preset="atlas",
+        layers=layers,
+    )
+
+    batch = capture_batch(
+        model,
+        token_ids,
+        predictions=False,
+        attention=True,
+        policy=policy,
+        **model_kwargs,
+    )
+
+    seq_lens = batch.metadata["seq_lens"]
+
+    # aligned_attention shape: (n_prompts, n_layers, n_heads, n_positions, max_seq_len)
+    # Transpose to:            (n_prompts, n_positions, n_layers, n_heads, max_seq_len)
+    aligned = batch.aligned_attention
+    attention = np.transpose(aligned, (0, 3, 1, 2, 4)).astype(np.float64)
+
+    return attention, seq_lens

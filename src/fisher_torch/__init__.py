@@ -6,6 +6,7 @@ from fisher_torch.capture import (
     ProjectionSpec,
     capture_batch,
     capture_forward,
+    extract_for_atlas,
 )
 from fisher_torch.convert import (
     from_simplex_array,
@@ -28,7 +29,7 @@ from fisher_torch.utils import (
     topk_softmax,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     # convert
@@ -52,6 +53,7 @@ __all__ = [
     # capture
     "capture_forward",
     "capture_batch",
+    "extract_for_atlas",
     "CaptureResult",
     "BatchCaptureResult",
     "ProjectionSpec",
